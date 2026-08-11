@@ -133,6 +133,15 @@ Tick **Reachable from the internet** and the daemon starts a Cloudflare quick tu
 change on every restart, which is why the menu offers a QR code instead of asking you to
 type one.
 
+Quick tunnels are genuinely free and need no Cloudflare account — `cloudflared` asks for
+no credentials and hands out a hostname on first run.
+
+**The free plan caps request bodies at 100 MB.** Photos and documents are fine; a 4K
+video is not, and it fails at Cloudflare's edge before it ever reaches your laptop, with
+an error that does not point at the real cause. There is no such limit on the LAN — the
+daemon disables the body cap entirely — so the practical split is LAN at home, tunnel
+when you are out.
+
 **This puts your receiver on the public internet.** The PIN is then the only thing in
 front of your Drop folder, so:
 
@@ -156,6 +165,37 @@ downloads are canonicalised and confirmed to be inside the Drop folder before op
 Through the tunnel they are HTTPS to Cloudflare, which terminates TLS and can see them.
 
 ## Where to take it next
+
+**Your own subdomain, on a named tunnel.** Quick tunnels hand out a random hostname that
+changes on every restart, which is why the tray shows a QR code. A *named* tunnel pins it
+to something like `share.yourdomain.com` permanently — so the iOS Shortcut is configured
+once and never breaks, at home or on cellular. Cloudflare Tunnel is free on the Free plan;
+if you already own the domain there is nothing to buy.
+
+The one requirement is that the domain's nameservers point at Cloudflare — a tunnel
+resolves through `*.cfargotunnel.com`, which only exists inside Cloudflare's DNS, so the
+zone has to be hosted there. Then, once:
+
+```bash
+cloudflared tunnel login          # opens a browser
+cloudflared tunnel create drop
+cloudflared tunnel route dns drop share.yourdomain.com
+```
+
+What the app still needs: a `tunnel_hostname` field in the config, so the daemon runs the
+named tunnel instead of a quick one and the tray shows the real URL. Worth pairing with
+**Cloudflare Access** in front of the hostname — email OTP or SSO before anything reaches
+the laptop, free for up to 50 users, and a great deal stronger than six digits on an
+internet-facing endpoint.
+
+Note this does *not* lift the 100 MB body cap; that is the plan, not the tunnel type.
+
+**Why not just point DNS at the machine.** Tempting, but a public A record needs a public
+IP, and the laptop only has private ones (`192.168.0.x`). The public address belongs to
+the router, so it would mean port-forwarding `8420` inward, a dynamic-DNS updater for when
+the ISP rotates the address, and the laptop sitting directly on the internet. It also
+breaks the moment you switch between Ethernet and Wi-Fi, since a forward targets one IP
+and this machine has two. The tunnel dials *out*, which sidesteps all of it.
 
 **Sender identity, not just a PIN.** A keypair per device, fingerprint in the mDNS TXT
 record, signed uploads — then the receiver can ask *"Accept 3 files from iPhone?"* and
