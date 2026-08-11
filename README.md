@@ -44,12 +44,27 @@ cargo build --release          # binary at target/release/drop
 cargo deb                      # package at target/debian/
 ```
 
+## The window
+
+Press **Super**, type `drop`. You get everything the tray menu has, in a real window:
+the QR code and PIN side by side, both addresses, switches for the tunnel and
+auto-move, the received-file list, and nearby devices. It refreshes every two seconds.
+
+It is served by the daemon on `/panel` and **refused to anything that is not loopback**,
+so it drives the same unauthenticated control API the tray uses without exposing it. On
+Chromium-family browsers it opens with `--app=`, giving a window with no tabs or address
+bar; elsewhere it falls back to a normal window.
+
+Right-click the icon in the dash for **Show the panel icon**, **Show QR code and PIN**,
+and **Open Drop folder**.
+
 ## The indicator
 
 Click the Drop icon in the top-right:
 
 ```
   Receiving as "keshava"
+  Open Drop window
   ─────────────────────────
   PIN  481902                                 ← click to copy
   Anywhere:  xyz.trycloudflare.com            ← only when the tunnel is on
@@ -86,7 +101,9 @@ against the panel. `drop qr` shows the same thing from a terminal.
 
 ```bash
 drop status                     # PIN, address, current settings
+drop panel                      # open the Drop window
 drop qr                         # QR + PIN for pairing a phone
+drop open                       # open the Drop folder
 drop peers                      # other devices advertising
 drop send thinkpad ~/photo.jpg  # push to a peer by name, IP, or host:port
 drop pin                        # new PIN, invalidates live sessions

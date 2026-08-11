@@ -5,6 +5,8 @@ mod config;
 mod discovery;
 mod net;
 mod page;
+mod panel;
+mod qr;
 mod send;
 mod server;
 mod tray;
@@ -53,6 +55,8 @@ enum Cmd {
         #[arg(long, default_value = "2")]
         wait: f32,
     },
+    /// Open the Drop window
+    Panel,
     /// Show the QR code and PIN for pairing a phone
     Qr,
     /// Open the Drop folder in the file manager
@@ -125,6 +129,12 @@ async fn main() -> Result<()> {
                 None => Config::load()?.pin,
             };
             send::send(&to, &send::expand(&files), &pin, secs(wait)).await
+        }
+
+        Cmd::Panel => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            panel::open(cfg.port)
         }
 
         Cmd::Qr => {

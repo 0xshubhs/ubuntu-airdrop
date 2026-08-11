@@ -154,14 +154,10 @@ async fn index(State(app): State<Arc<App>>) -> Html<String> {
     ))
 }
 
-async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
-    if let Err(r) = guard(&app, &headers).await {
-        return r;
-    }
-
-    let dir = app.dir().await;
+/// Everything in the Drop folder, newest first.
+async fn list_files(dir: &std::path::Path) -> Vec<Received> {
     let mut files = Vec::new();
-    if let Ok(mut rd) = tokio::fs::read_dir(&dir).await {
+    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             let name = entry.file_name().to_string_lossy().to_string();
             if name.starts_with('.') {
@@ -179,16 +175,26 @@ async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            files.push((mtime, Received {
-                name,
-                size: human_size(meta.len()),
-                when: clock(mtime),
-            }));
+            files.push((
+                mtime,
+                Received {
+                    name,
+                    size: human_size(meta.len()),
+                    when: clock(mtime),
+                },
+            ));
         }
     }
     files.sort_by(|a, b| b.0.cmp(&a.0));
-    let files: Vec<Received> = files.into_iter().map(|(_, f)| f).take(60).collect();
+    files.into_iter().map(|(_, f)| f).take(60).collect()
+}
 
+async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+    if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+
+    let files = list_files(&app.dir().await).await;
     let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
     Json(json!({
         "device": app.cfg.read().await.name,
@@ -384,7 +390,8 @@ async fn status(
     }
     let cfg = app.cfg.read().await.clone();
     let recent: Vec<_> = app.recent.read().await.iter().cloned().collect();
-    let files_waiting = count_files(&cfg.dir).await;
+    let files = list_files(&cfg.dir).await;
+    let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
 
     Json(json!({
         "name": cfg.name,
@@ -398,10 +405,60 @@ async fn status(
         "move_target": cfg.move_target,
         "received": app.counter.load(Ordering::Relaxed),
         "recent": recent,
-        "peers": app.peers.read().await.len(),
-        "files_waiting": files_waiting,
+        "peers": peers.len(),
+        "peers_list": peers,
+        "files": files,
+        "files_waiting": files.len(),
     }))
     .into_response()
+}
+
+/// The Drop window. Same information as the tray menu, in a real window.
+async fn panel(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    Html(crate::panel::PANEL.to_string()).into_response()
+}
+
+async fn panel_qr(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let cfg = app.cfg.read().await.clone();
+    let target = app
+        .tunnel_url
+        .read()
+        .await
+        .clone()
+        .unwrap_or_else(|| cfg.local_url());
+
+    match crate::qr::svg(&target, &cfg.pin, 6) {
+        Ok(svg) => (
+            [
+                (header::CONTENT_TYPE, "image/svg+xml"),
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            svg,
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn open_folder(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let dir = app.dir().await;
+    let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
+    Json(json!({"opened": dir})).into_response()
 }
 
 async fn count_files(dir: &std::path::Path) -> usize {
@@ -528,6 +585,9 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/upload", post(upload))
         .route("/files/{fname}", get(download))
         .route("/api/status", get(status))
+        .route("/panel", get(panel))
+        .route("/panel/qr.svg", get(panel_qr))
+        .route("/api/control/open", post(open_folder))
         .route("/api/control/auto-move", post(set_auto_move))
         .route("/api/control/tunnel", post(set_tunnel))
         .route("/api/control/move-all", post(move_all))
