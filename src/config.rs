@@ -28,6 +28,10 @@ pub struct Config {
     /// public internet, where the PIN is the only thing standing in the way.
     #[serde(default)]
     pub tunnel: bool,
+    /// Hold incoming files until they are accepted, instead of writing
+    /// straight into `dir`. This is the AirDrop behaviour.
+    #[serde(default = "yes")]
+    pub require_approval: bool,
     /// HMAC key for session cookies. Regenerating it logs everyone out.
     pub secret: String,
 }
@@ -43,9 +47,14 @@ impl Default for Config {
             auto_move: false,
             move_target: dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
             tunnel: false,
+            require_approval: true,
             secret: random_hex(32),
         }
     }
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl Config {

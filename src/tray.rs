@@ -13,10 +13,29 @@ use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Deserialize, Default)]
+pub struct OfferFile {
+    pub name: String,
+    #[serde(default)]
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct PendingOffer {
+    pub id: String,
+    pub device: String,
+    #[serde(default)]
+    pub files: Vec<OfferFile>,
+    #[serde(default)]
+    pub total: u64,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
 pub struct Status {
     pub name: String,
     pub pin: String,
     pub dir: PathBuf,
+    #[serde(default)]
+    pub offers: Vec<PendingOffer>,
     pub local_url: String,
     pub tunnel_enabled: bool,
     pub tunnel_url: Option<String>,
@@ -103,6 +122,57 @@ impl Tray for DropTray {
         };
 
         let mut items: Vec<MenuItem<Self>> = Vec::new();
+
+        // Anything waiting on a decision goes first — it is the only thing in
+        // this menu that is time-sensitive.
+        for offer in &s.offers {
+            let n = offer.files.len();
+            items.push(
+                StandardItem {
+                    label: format!(
+                        "{} wants to send {} {}{}",
+                        offer.device,
+                        n,
+                        if n == 1 { "file" } else { "files" },
+                        if offer.total > 0 {
+                            format!("  ({})", crate::net::human_size(offer.total))
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let accept_id = offer.id.clone();
+            items.push(
+                StandardItem {
+                    label: "    Accept".into(),
+                    activate: Box::new(move |this: &mut Self| {
+                        let url = this.url(&format!("/api/control/offer/{accept_id}"));
+                        tokio::spawn(async move { decide(url, true).await });
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+
+            let decline_id = offer.id.clone();
+            items.push(
+                StandardItem {
+                    label: "    Decline".into(),
+                    activate: Box::new(move |this: &mut Self| {
+                        let url = this.url(&format!("/api/control/offer/{decline_id}"));
+                        tokio::spawn(async move { decide(url, false).await });
+                    }),
+                    ..Default::default()
+                }
+                .into(),
+            );
+            items.push(MenuItem::Separator);
+        }
 
         items.push(
             StandardItem {
@@ -449,6 +519,7 @@ pub async fn run(port: u16) -> Result<()> {
     // Seed from the daemon's current count so we don't announce a backlog
     // that arrived before the tray started.
     let mut seen: Option<u64> = None;
+    let mut announced: std::collections::HashSet<String> = Default::default();
 
     loop {
         let fetched: Option<Status> = match client
@@ -470,6 +541,15 @@ pub async fn run(port: u16) -> Result<()> {
                 }
                 _ => {}
             }
+
+            // An offer expires in five minutes, so it has to be noticed
+            // without the menu being open.
+            for offer in &s.offers {
+                if announced.insert(offer.id.clone()) {
+                    notify_offer(offer, port);
+                }
+            }
+            announced.retain(|id| s.offers.iter().any(|o| &o.id == id));
         }
 
         handle
@@ -480,6 +560,74 @@ pub async fn run(port: u16) -> Result<()> {
 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
+}
+
+async fn decide(url: String, accept: bool) {
+    let _ = reqwest::Client::new()
+        .post(url)
+        .json(&serde_json::json!({"accept": accept}))
+        .send()
+        .await;
+}
+
+/// Raise the accept/decline prompt as a desktop notification with buttons.
+///
+/// `notify-send --action` needs a notification daemon that supports actions
+/// and blocks until one is chosen, so it runs detached; if the desktop
+/// ignores the actions the menu and the window still carry the decision.
+fn notify_offer(offer: &PendingOffer, port: u16) {
+    let n = offer.files.len();
+    let body = format!(
+        "{} {} · {}",
+        n,
+        if n == 1 { "file" } else { "files" },
+        offer
+            .files
+            .iter()
+            .map(|f| {
+                if f.size > 0 {
+                    format!("{} ({})", f.name, crate::net::human_size(f.size))
+                } else {
+                    f.name.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+            .chars()
+            .take(120)
+            .collect::<String>()
+    );
+    let summary = format!("{} wants to send you files", offer.device);
+    let id = offer.id.clone();
+
+    std::thread::spawn(move || {
+        let out = Command::new("notify-send")
+            .args([
+                "--app-name=Drop",
+                "--icon=folder-download",
+                "--urgency=critical",
+                "--action=accept=Accept",
+                "--action=decline=Decline",
+                &summary,
+                &body,
+            ])
+            .output();
+
+        let Ok(out) = out else { return };
+        let choice = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if choice.is_empty() {
+            return; // dismissed, or the desktop does not do actions
+        }
+        let url = format!("http://127.0.0.1:{port}/api/control/offer/{id}");
+        let body = format!("{{\"accept\":{}}}", choice == "accept");
+        let _ = Command::new("curl")
+            .args([
+                "-s", "-o", "/dev/null", "-X", "POST",
+                "-H", "Content-Type: application/json",
+                "-d", &body, &url,
+            ])
+            .status();
+    });
 }
 
 /// Shell out to `notify-send` rather than link a notification library:

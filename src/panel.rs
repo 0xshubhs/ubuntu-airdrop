@@ -82,6 +82,27 @@ pub const PANEL: &str = r####"<!doctype html>
     background:var(--ink); color:var(--paper); padding:.5rem 1rem; border-radius:999px;
     font-size:.8rem; opacity:0; transition:opacity .2s; pointer-events:none}
   .toast.on{opacity:1}
+
+  /* Incoming transfer */
+  .offer{border:2px solid var(--signal); border-radius:10px; padding:1rem;
+         margin-bottom:1.25rem; background:var(--sunk)}
+  .offer h3{margin:0 0 .1rem; font-size:1.05rem}
+  .offer .from{color:var(--signal); font-weight:700}
+  .offer .sub{color:var(--muted); font-size:.8rem; margin-bottom:.6rem}
+  .offer ul{max-height:8.5rem; overflow-y:auto; margin-bottom:.8rem}
+  .offer li{padding:.3rem 0; font-size:.83rem}
+  .offer .btns{display:flex; gap:.6rem}
+  .offer button{flex:1; font:inherit; font-size:.9rem; padding:.55rem; cursor:pointer;
+                border-radius:7px; border:1px solid var(--rule); background:transparent;
+                color:inherit}
+  .offer button.yes{background:var(--live); border-color:var(--live); color:#fff;
+                    font-weight:600}
+  .offer button.yes:hover{filter:brightness(1.08)}
+  .offer button.no:hover{border-color:var(--signal); color:var(--signal)}
+  @media (prefers-reduced-motion:no-preference){
+    .offer{animation:pop .18s ease-out}
+  }
+  @keyframes pop{from{transform:scale(.97); opacity:0}to{transform:scale(1); opacity:1}}
 </style>
 </head><body>
 
@@ -89,6 +110,8 @@ pub const PANEL: &str = r####"<!doctype html>
   <h1>Drop</h1>
   <span class="who mono" id="who"></span>
 </header>
+
+<div id="offers"></div>
 
 <div class="hero">
   <img id="qr" alt="QR code for pairing a phone">
@@ -105,6 +128,11 @@ pub const PANEL: &str = r####"<!doctype html>
   <span class="label">Reachable from the internet
     <small id="tunnel-note">Off — this network only</small></span>
   <label class="sw"><input type="checkbox" id="t-tunnel"><i></i></label>
+</div>
+<div class="row">
+  <span class="label">Ask before receiving
+    <small>Nothing is saved until you accept it</small></span>
+  <label class="sw"><input type="checkbox" id="t-approval"><i></i></label>
 </div>
 <div class="row">
   <span class="label">Always move to Downloads
@@ -163,8 +191,54 @@ $('#pin').onclick = () => last && copy(last.pin);
 $('#b-open').onclick = () => post('/api/control/open');
 $('#b-move').onclick = () => post('/api/control/move-all').then(() => toast('Moved'));
 $('#b-pin').onclick  = () => { if (confirm('Generate a new PIN? Every signed-in device is logged out.')) post('/api/control/pin'); };
-$('#t-tunnel').onchange = e => post('/api/control/tunnel', {enabled: e.target.checked});
-$('#t-move').onchange   = e => post('/api/control/auto-move', {enabled: e.target.checked});
+$('#t-tunnel').onchange   = e => post('/api/control/tunnel', {enabled: e.target.checked});
+$('#t-move').onchange     = e => post('/api/control/auto-move', {enabled: e.target.checked});
+$('#t-approval').onchange = e => post('/api/control/approval', {enabled: e.target.checked});
+
+function bytes(n){
+  if (n < 1024) return n + ' B';
+  const u = ['KB','MB','GB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(1) + ' ' + u[i];
+}
+
+async function decide(id, accept){
+  await post('/api/control/offer/' + encodeURIComponent(id), {accept});
+  toast(accept ? 'Accepted' : 'Declined');
+}
+
+function renderOffers(list){
+  const box = $('#offers');
+  if (!list || !list.length){ box.innerHTML = ''; box.dataset.ids = ''; return; }
+
+  // Only repaint when the set changes, so the buttons stay clickable
+  // through the two-second refresh.
+  const ids = list.map(o => o.id).join(',');
+  if (box.dataset.ids === ids) return;
+  box.dataset.ids = ids;
+
+  box.innerHTML = list.map(o => {
+    const n = o.files.length;
+    const size = o.total ? ' · ' + bytes(o.total) : '';
+    return `<div class="offer">
+      <h3><span class="from">${esc(o.device)}</span> wants to send you
+        ${n} ${n === 1 ? 'file' : 'files'}</h3>
+      <div class="sub">${esc(String(n))} ${n === 1 ? 'item' : 'items'}${size}</div>
+      <ul>${o.files.map(f =>
+        `<li><span class="name">${esc(f.name)}</span>`
+        + `<span class="meta mono">${f.size ? bytes(f.size) : ''}</span></li>`).join('')}</ul>
+      <div class="btns">
+        <button class="no"  data-no="${esc(o.id)}">Decline</button>
+        <button class="yes" data-yes="${esc(o.id)}">Accept</button>
+      </div>
+    </div>`;
+  }).join('');
+
+  box.querySelectorAll('[data-yes]').forEach(b =>
+    b.onclick = () => decide(b.dataset.yes, true));
+  box.querySelectorAll('[data-no]').forEach(b =>
+    b.onclick = () => decide(b.dataset.no, false));
+}
 
 async function refresh(){
   if (busy) return;
@@ -195,8 +269,11 @@ async function refresh(){
     $('#qr').src = '/panel/qr.svg?v=' + encodeURIComponent(target);
   }
 
-  if (document.activeElement !== $('#t-tunnel')) $('#t-tunnel').checked = s.tunnel_enabled;
-  if (document.activeElement !== $('#t-move'))   $('#t-move').checked   = s.auto_move;
+  renderOffers(s.offers);
+
+  if (document.activeElement !== $('#t-tunnel'))   $('#t-tunnel').checked   = s.tunnel_enabled;
+  if (document.activeElement !== $('#t-move'))     $('#t-move').checked     = s.auto_move;
+  if (document.activeElement !== $('#t-approval')) $('#t-approval').checked = s.require_approval;
   $('#tunnel-note').textContent = s.tunnel_enabled
     ? (pub ? 'On — ' + pub.replace('https://','') : 'Starting…')
     : 'Off — this network only';

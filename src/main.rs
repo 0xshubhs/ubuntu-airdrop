@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod discovery;
 mod net;
+mod offers;
 mod page;
 mod panel;
 mod qr;

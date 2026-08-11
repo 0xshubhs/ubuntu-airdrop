@@ -7,7 +7,9 @@ use crate::net::{human_size, is_loopback, safe_name};
 use crate::page;
 use anyhow::Result;
 use axum::body::Body;
-use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Path as AxPath, State};
+use axum::extract::{
+    ConnectInfo, DefaultBodyLimit, Multipart, Path as AxPath, Query as AxQuery, State,
+};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
@@ -40,6 +42,7 @@ pub struct App {
     pub recent: RwLock<VecDeque<Received>>,
     pub counter: AtomicU64,
     pub tunnel_tx: mpsc::Sender<bool>,
+    pub offers: crate::offers::Registry,
 }
 
 impl App {
@@ -236,89 +239,246 @@ fn local_offset_secs() -> i64 {
     })
 }
 
-async fn upload(
+/// Who is sending. Senders that can say so set `X-Drop-Device`.
+fn sender_name(headers: &HeaderMap, addr: &SocketAddr) -> String {
+    headers
+        .get("x-drop-device")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(64).collect())
+        .unwrap_or_else(|| format!("Device at {}", addr.ip()))
+}
+
+#[derive(Deserialize)]
+struct OfferReq {
+    #[serde(default)]
+    device: Option<String>,
+    files: Vec<crate::offers::OfferFile>,
+}
+
+/// Announce an intent to send. Nothing is transferred yet.
+async fn create_offer(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(req): Json<OfferReq>,
+) -> Response {
+    if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+    if req.files.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no files"}))).into_response();
+    }
+
+    let device = req
+        .device
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| sender_name(&headers, &addr));
+
+    let offer = app.offers.create(device, req.files, None).await;
+    println!(
+        "  ?  {} wants to send {} file(s)  [{}]",
+        offer.device,
+        offer.files.len(),
+        offer.id
+    );
+    (StatusCode::CREATED, Json(json!(offer))).into_response()
+}
+
+/// Sender polls this until the verdict is in.
+async fn offer_status(
     State(app): State<Arc<App>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    AxPath(id): AxPath<String>,
+) -> Response {
+    if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+    match app.offers.get(&id).await {
+        Some(offer) => Json(json!(offer)).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": "no such offer"}))).into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    #[serde(default)]
+    offer: Option<String>,
+}
+
+async fn upload(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    AxQuery(q): AxQuery<UploadQuery>,
+    multipart: Multipart,
 ) -> Response {
     if let Err(r) = guard(&app, &headers).await {
         return r;
     }
 
-    let (dir, auto_move, target) = {
+    let (dir, auto_move, target, require_approval) = {
         let cfg = app.cfg.read().await;
-        (cfg.dir.clone(), cfg.auto_move, cfg.move_target.clone())
+        (
+            cfg.dir.clone(),
+            cfg.auto_move,
+            cfg.move_target.clone(),
+            cfg.require_approval,
+        )
     };
     if let Err(e) = tokio::fs::create_dir_all(&dir).await {
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    let mut saved = Vec::new();
+    // Path 1: the sender negotiated first and was accepted.
+    if let Some(id) = q.offer {
+        return match app.offers.get(&id).await {
+            None => (StatusCode::NOT_FOUND, Json(json!({"error": "no such offer"}))).into_response(),
+            Some(o) if o.status != crate::offers::Status::Accepted => (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "offer not accepted", "status": o.status})),
+            )
+                .into_response(),
+            Some(_) => {
+                let res = drain(&app, multipart, &dir, auto_move, target).await;
+                app.offers.set_status(&id, crate::offers::Status::Complete).await;
+                res
+            }
+        };
+    }
+
+    // Path 2: approval is off — behave as before.
+    if !require_approval {
+        return drain(&app, multipart, &dir, auto_move, target).await;
+    }
+
+    // Path 3: a one-shot sender (the iOS Shortcut). Take the bytes, but park
+    // them out of sight until the verdict.
+    let stage = dir.join(".staging").join(crate::config::random_hex(8));
+    if let Err(e) = tokio::fs::create_dir_all(&stage).await {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+    }
+
+    let staged = match stream_to(multipart, &stage).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&stage).await;
+            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+        }
+    };
+    if staged.is_empty() {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no files"}))).into_response();
+    }
+
+    let device = sender_name(&headers, &addr);
+    let offer = app.offers.create(device, staged, Some(stage)).await;
+    println!(
+        "  ?  {} sent {} file(s), waiting for approval  [{}]",
+        offer.device,
+        offer.files.len(),
+        offer.id
+    );
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "pending_approval",
+            "offer": offer.id,
+            "message": "Waiting for the receiver to accept.",
+        })),
+    )
+        .into_response()
+}
+
+/// Write every part into `into`, returning what was written.
+async fn stream_to(
+    mut multipart: Multipart,
+    into: &std::path::Path,
+) -> Result<Vec<crate::offers::OfferFile>> {
+    let mut out = Vec::new();
     loop {
-        let field = match multipart.next_field().await {
+        let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+            Err(e) => anyhow::bail!(e.to_string()),
         };
         let Some(raw) = field.file_name().map(|s| s.to_string()) else {
             continue;
         };
 
-        let mut path = safe_name(&raw, &dir);
+        let path = safe_name(&raw, into);
         let mut written: u64 = 0;
-        let mut field = field;
-
-        let mut file = match tokio::fs::File::create(&path).await {
-            Ok(f) => f,
-            Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-        };
+        let mut file = tokio::fs::File::create(&path).await?;
         loop {
             match field.chunk().await {
                 Ok(Some(bytes)) => {
-                    if let Err(e) = file.write_all(&bytes).await {
-                        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-                    }
+                    file.write_all(&bytes).await?;
                     written += bytes.len() as u64;
                 }
                 Ok(None) => break,
                 Err(e) => {
                     // Half a file is worse than none.
                     let _ = tokio::fs::remove_file(&path).await;
-                    return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+                    anyhow::bail!(e.to_string());
                 }
             }
         }
-        if let Err(e) = file.flush().await {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
-        }
-        drop(file);
+        file.flush().await?;
+        out.push(crate::offers::OfferFile {
+            name: path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default(),
+            size: written,
+        });
+    }
+    Ok(out)
+}
 
+/// Accept the parts straight into the Drop folder and record them.
+async fn drain(
+    app: &Arc<App>,
+    multipart: Multipart,
+    dir: &std::path::Path,
+    auto_move: bool,
+    target: PathBuf,
+) -> Response {
+    let written = match stream_to(multipart, dir).await {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+    };
+
+    let mut saved = Vec::new();
+    for f in written {
+        let mut path = dir.join(&f.name);
         if auto_move {
             if let Ok(moved) = relocate(&path, &target).await {
                 path = moved;
             }
         }
-
         let name = path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        println!("  <- {name}  ({})", human_size(written));
-
-        let mut recent = app.recent.write().await;
-        recent.push_front(Received {
-            name: name.clone(),
-            size: human_size(written),
-            when: clock(auth::now()),
-        });
-        recent.truncate(RECENT_MAX);
-        drop(recent);
-
-        app.counter.fetch_add(1, Ordering::Relaxed);
+        println!("  <- {name}  ({})", human_size(f.size));
+        note_received(app, &name, f.size).await;
         saved.push(name);
     }
-
     Json(json!({"saved": saved})).into_response()
+}
+
+async fn note_received(app: &Arc<App>, name: &str, size: u64) {
+    let mut recent = app.recent.write().await;
+    recent.push_front(Received {
+        name: name.to_string(),
+        size: human_size(size),
+        when: clock(auth::now()),
+    });
+    recent.truncate(RECENT_MAX);
+    drop(recent);
+    app.counter.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Move a finished file out of the Drop folder. `rename` fails across
@@ -409,6 +569,8 @@ async fn status(
         "peers_list": peers,
         "files": files,
         "files_waiting": files.len(),
+        "require_approval": cfg.require_approval,
+        "offers": app.offers.pending().await,
     }))
     .into_response()
 }
@@ -449,6 +611,75 @@ async fn panel_qr(
     }
 }
 
+#[derive(Deserialize)]
+struct Verdict {
+    accept: bool,
+}
+
+/// Accept or decline a pending transfer. Loopback only — this is the
+/// receiver's decision and nobody else's.
+async fn decide_offer(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    AxPath(id): AxPath<String>,
+    Json(req): Json<Verdict>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+
+    let Some(offer) = app.offers.decide(&id, req.accept).await else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "no such offer"}))).into_response();
+    };
+
+    let Some(stage) = offer.staged.clone() else {
+        // Negotiated transfer: the sender is polling and will now upload.
+        println!(
+            "  {} {}",
+            if req.accept { "accepted" } else { "declined" },
+            offer.device
+        );
+        return Json(json!(offer)).into_response();
+    };
+
+    // Staged transfer: the bytes are already here, so the verdict decides
+    // whether they surface or get shredded.
+    if !req.accept {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        println!("  declined {} — staged files deleted", offer.device);
+        return Json(json!(offer)).into_response();
+    }
+
+    let (dir, auto_move, target) = {
+        let cfg = app.cfg.read().await;
+        (cfg.dir.clone(), cfg.auto_move, cfg.move_target.clone())
+    };
+    let dest = if auto_move { target } else { dir };
+
+    let mut saved = Vec::new();
+    if let Ok(mut rd) = tokio::fs::read_dir(&stage).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            let from = entry.path();
+            let size = entry.metadata().await.map(|m| m.len()).unwrap_or(0);
+            if let Ok(moved) = relocate(&from, &dest).await {
+                let name = moved
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                println!("  <- {name}  ({})", human_size(size));
+                note_received(&app, &name, size).await;
+                saved.push(name);
+            }
+        }
+    }
+    let _ = tokio::fs::remove_dir_all(&stage).await;
+    app.offers
+        .set_status(&id, crate::offers::Status::Complete)
+        .await;
+
+    Json(json!({"accepted": saved})).into_response()
+}
+
 async fn open_folder(
     State(app): State<Arc<App>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -459,21 +690,6 @@ async fn open_folder(
     let dir = app.dir().await;
     let _ = std::process::Command::new("xdg-open").arg(&dir).spawn();
     Json(json!({"opened": dir})).into_response()
-}
-
-async fn count_files(dir: &std::path::Path) -> usize {
-    let mut n = 0;
-    if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
-        while let Ok(Some(e)) = rd.next_entry().await {
-            if e.file_name().to_string_lossy().starts_with('.') {
-                continue;
-            }
-            if e.metadata().await.map(|m| m.is_file()).unwrap_or(false) {
-                n += 1;
-            }
-        }
-    }
-    n
 }
 
 #[derive(Deserialize)]
@@ -496,6 +712,23 @@ async fn set_auto_move(
     };
     let _ = cfg.save();
     Json(json!({"auto_move": req.enabled})).into_response()
+}
+
+async fn set_approval(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<Toggle>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let cfg = {
+        let mut cfg = app.cfg.write().await;
+        cfg.require_approval = req.enabled;
+        cfg.clone()
+    };
+    let _ = cfg.save();
+    Json(json!({"require_approval": req.enabled})).into_response()
 }
 
 async fn set_tunnel(
@@ -583,12 +816,16 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/auth", post(do_auth))
         .route("/api/state", get(state))
         .route("/api/upload", post(upload))
+        .route("/api/offer", post(create_offer))
+        .route("/api/offer/{id}", get(offer_status))
+        .route("/api/control/offer/{id}", post(decide_offer))
         .route("/files/{fname}", get(download))
         .route("/api/status", get(status))
         .route("/panel", get(panel))
         .route("/panel/qr.svg", get(panel_qr))
         .route("/api/control/open", post(open_folder))
         .route("/api/control/auto-move", post(set_auto_move))
+        .route("/api/control/approval", post(set_approval))
         .route("/api/control/tunnel", post(set_tunnel))
         .route("/api/control/move-all", post(move_all))
         .route("/api/control/pin", post(new_pin))
@@ -611,6 +848,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         recent: RwLock::new(VecDeque::new()),
         counter: AtomicU64::new(0),
         tunnel_tx,
+        offers: Default::default(),
         cfg: RwLock::new(cfg.clone()),
     });
 
@@ -648,6 +886,19 @@ pub async fn serve(cfg: Config) -> Result<()> {
                 match tunnel_rx.recv().await {
                     Some(next) => enabled = next,
                     None => break,
+                }
+            }
+        });
+    }
+
+    // Reap offers nobody answered, and the bytes they were holding.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                for orphan in app.offers.sweep().await {
+                    let _ = tokio::fs::remove_dir_all(&orphan).await;
                 }
             }
         });

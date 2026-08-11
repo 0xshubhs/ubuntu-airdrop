@@ -44,6 +44,41 @@ cargo build --release          # binary at target/release/drop
 cargo deb                      # package at target/debian/
 ```
 
+## Accept before receiving
+
+Nothing lands in your folder unless you say so. A sender announces itself first, you get
+a notification and a card in the window —
+
+```
+  Shubham's iPhone wants to send you 3 files
+  3 items · 4.2 MB
+    IMG_2718.jpeg      2.0 MB
+    Receipt.pdf        187 KB
+    notes.txt          304 B
+  [ Decline ]  [ Accept ]
+```
+
+— and only then does anything reach `~/Drop`. Decline and it is deleted. The prompt shows
+up in three places: a desktop notification with Accept/Decline buttons, the top of the
+Drop window, and the top of the tray menu.
+
+There are two ways in, because an iOS Shortcut can only make **one** HTTP request and so
+cannot offer, wait, then upload:
+
+- **Negotiated** — `POST /api/offer` with the file list, wait for the verdict, then
+  `POST /api/upload?offer=<id>`. Not a byte is transferred before you accept. This is what
+  `drop send` and the web page use, so Linux-to-Linux works this way too.
+- **Staged** — a one-shot `POST /api/upload`. The bytes stream into a hidden
+  `.staging/` folder inside the Drop directory and an offer is raised for them. They only
+  become visible on Accept, and are deleted on Decline. The sender gets `202` rather
+  than `200`.
+
+Undecided offers expire after five minutes and their staged bytes are swept. Accept and
+decline are loopback-only — nothing on the network can answer on your behalf.
+
+Turn it off with **Ask before receiving** in the window if you would rather transfers
+just land.
+
 ## The window
 
 Press **Super**, type `drop`. You get everything the tray menu has, in a real window:
@@ -63,6 +98,10 @@ and **Open Drop folder**.
 Click the Drop icon in the top-right:
 
 ```
+  Shubham's iPhone wants to send 3 files  (4.2 MB)
+      Accept
+      Decline
+  ─────────────────────────
   Receiving as "keshava"
   Open Drop window
   ─────────────────────────
@@ -123,6 +162,8 @@ journalctl --user -u drop -f    # watch files land
    - URL: `http://keshava.local:8420/api/upload` *(your hostname)*
    - Method **POST**
    - Header `X-Drop-Pin` = your PIN
+   - Header `X-Drop-Device` = `Shubham's iPhone` — this is the name you see on the
+     accept prompt; without it you get "Device at 192.168.0.x"
    - Request Body **Form** → add field, type **File**, key `files`, value **Shortcut Input**
 
 Any photo, file, or webpage → Share → *Drop to Ubuntu*.
@@ -147,6 +188,7 @@ Script**, *Pass input* as **arguments**:
 ```bash
 for f in "$@"; do
   /usr/bin/curl -s -F "files=@$f" -H "X-Drop-Pin: YOUR-PIN" \
+    -H "X-Drop-Device: Shubham's MacBook" \
     http://keshava.local:8420/api/upload
 done
 ```
