@@ -61,9 +61,17 @@ pub const PAGE: &str = r####"<!doctype html>
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
   .empty{color:var(--muted); font-size:.85rem; padding:.55rem 0}
   #bar{height:2px; background:var(--signal); width:0; transition:width .1s; margin-top:1rem}
-  #held{border:1.5px solid var(--signal); padding:1.1rem; text-align:center; margin-bottom:1rem}
+  #held{border:1.5px solid var(--signal); padding:1.1rem; text-align:center;
+        margin-bottom:1rem; transition:border-color .2s}
   #held strong{display:block; font-size:.95rem; margin-bottom:.15rem}
   #held span{color:var(--muted); font-size:.85rem}
+  #held.yes{border-color:var(--live)} #held.yes strong{color:var(--live)}
+  #held.no strong{color:var(--signal)}
+  @media (prefers-reduced-motion:no-preference){
+    #held.wait strong::after{content:""; display:inline-block; width:.5em;
+      animation:dots 1.2s steps(4,end) infinite}
+  }
+  @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
   footer{margin-top:2.5rem; color:var(--muted); font-size:.78rem}
   #gate{text-align:center; padding:3rem 0}
   #gate p{color:var(--muted); font-size:.85rem; margin:.4rem 0 1.6rem}
@@ -90,8 +98,8 @@ pub const PAGE: &str = r####"<!doctype html>
 
 <main id="app" hidden>
   <div id="held" hidden>
-    <strong>Sent — waiting to be accepted</strong>
-    <span>The receiving device has to approve this transfer.</span>
+    <strong id="held-title">Waiting to be accepted…</strong>
+    <span id="held-sub">The other device has to approve this transfer.</span>
   </div>
 
   <div id="zone" tabindex="0" role="button">
@@ -169,7 +177,12 @@ function upload(list){
     bar.style.width = '0'; picker.value = '';
     if (xhr.status === 401) { showGate('Session expired. Enter the PIN again.'); return; }
     // 202: the receiver has the bytes but has not accepted them yet.
-    if (xhr.status === 202) { waitForApproval(); return; }
+    if (xhr.status === 202) {
+      let id = null;
+      try { id = JSON.parse(xhr.responseText).offer; } catch {}
+      waitForApproval(id);
+      return;
+    }
     if (xhr.status !== 200) { alert('Transfer failed: ' + xhr.status); return; }
     refresh();
   };
@@ -177,20 +190,51 @@ function upload(list){
   xhr.send(form);
 }
 
-// Show the holding notice until the file count moves, meaning it was taken.
-function waitForApproval(){
-  const held = $('#held');
-  held.hidden = false;
-  let seen = null, ticks = 0;
+// Follow one offer to its verdict, so the sender sees what actually happened
+// rather than a status code.
+function waitForApproval(id){
+  const box = $('#held'), title = $('#held-title'), sub = $('#held-sub');
+  box.hidden = false;
+  box.className = 'wait';
+  title.textContent = 'Waiting to be accepted';
+  sub.textContent = 'The other device has to approve this transfer.';
+
+  const settle = (cls, head, tail, keep) => {
+    box.className = cls;
+    title.textContent = head;
+    sub.textContent = tail;
+    refresh();
+    setTimeout(() => { box.hidden = true; box.className = ''; }, keep);
+  };
+
+  // No id means an older receiver: fall back to a plain notice.
+  if (!id){
+    setTimeout(() => { box.hidden = true; refresh(); }, 4000);
+    return;
+  }
+
+  let ticks = 0;
   const timer = setInterval(async () => {
-    ticks++;
-    let s;
-    try { s = await (await fetch('/api/state')).json(); } catch { return; }
-    if (seen === null) { seen = s.files.length; return; }
-    if (s.files.length !== seen || ticks > 150){
-      clearInterval(timer); held.hidden = true; refresh();
+    if (++ticks > 200){                       // ~5 min, past the offer TTL
+      clearInterval(timer);
+      settle('no', 'No response', 'The transfer expired without an answer.', 6000);
+      return;
     }
-  }, 2000);
+    let s;
+    try { s = await (await fetch('/api/offer/' + encodeURIComponent(id))).json(); }
+    catch { return; }
+
+    if (s.status === 'accepted' || s.status === 'complete'){
+      clearInterval(timer);
+      settle('yes', 'Accepted', 'Your files are on the other device.', 4000);
+    } else if (s.status === 'declined'){
+      clearInterval(timer);
+      settle('no', 'Declined', 'The other device turned this transfer down.', 6000);
+    } else if (s.status === 'expired'){
+      clearInterval(timer);
+      settle('no', 'No response', 'The transfer expired without an answer.', 6000);
+    }
+  }, 1500);
 }
 
 async function refresh(){

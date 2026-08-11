@@ -148,13 +148,20 @@ async fn do_auth(
 // pages and transfers
 // ---------------------------------------------------------------------------
 
-async fn index(State(app): State<Arc<App>>) -> Html<String> {
+async fn index(State(app): State<Arc<App>>) -> Response {
     let cfg = app.cfg.read().await;
-    Html(page::render(
+    let body = page::render(
         &cfg.name,
         &format!("{}:{}", crate::net::lan_ip(), cfg.port),
         &cfg.dir.display().to_string(),
-    ))
+    );
+    // The page ships inside the binary, so an upgrade changes it. Safari will
+    // otherwise keep running the version it first saw.
+    (
+        [(header::CACHE_CONTROL, "no-store, must-revalidate")],
+        Html(body),
+    )
+        .into_response()
 }
 
 /// Everything in the Drop folder, newest first.
