@@ -51,10 +51,10 @@ Click the Drop icon in the top-right:
 ```
   Receiving as "keshava"
   ─────────────────────────
-  PIN  481902                   ← click to copy
-  http://192.168.0.113:8420     ← click to copy
-  Internet: xyz.trycloudflare.com
-  Show QR code…                 ← scan from the phone
+  PIN  481902                                 ← click to copy
+  Anywhere:  xyz.trycloudflare.com            ← only when the tunnel is on
+  This network only:  http://192.168.0.113:8420
+  Show QR code…                               ← QR + PIN, scan from the phone
   ─────────────────────────
   3 files waiting
   1 other device nearby
@@ -72,10 +72,21 @@ of `~/Drop` into `~/Downloads` the moment it lands, so the Drop folder stays emp
 **Move all to Downloads** does the same on demand. Moves fall back to copy-then-delete
 across filesystems.
 
+The two addresses are deliberately labelled. *This network only* is a LAN IP — it works
+from the sofa and nowhere else. *Anywhere* appears only once the tunnel is running, and is
+the one to use from mobile data. The QR always encodes whichever is the more reachable of
+the two, and prints the PIN underneath it.
+
+The QR opens in an image viewer rather than inside the menu. gnome-shell draws the tray
+menu over the StatusNotifierItem D-Bus protocol, which carries labels, checkmarks and
+small icons but not arbitrary images — and Wayland does not let a client position a window
+against the panel. `drop qr` shows the same thing from a terminal.
+
 ## CLI
 
 ```bash
 drop status                     # PIN, address, current settings
+drop qr                         # QR + PIN for pairing a phone
 drop peers                      # other devices advertising
 drop send thinkpad ~/photo.jpg  # push to a peer by name, IP, or host:port
 drop pin                        # new PIN, invalidates live sessions

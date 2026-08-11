@@ -53,6 +53,8 @@ enum Cmd {
         #[arg(long, default_value = "2")]
         wait: f32,
     },
+    /// Show the QR code and PIN for pairing a phone
+    Qr,
     /// Print this device's PIN and address
     Status,
     /// Generate a new PIN, invalidating existing sessions
@@ -121,6 +123,18 @@ async fn main() -> Result<()> {
                 None => Config::load()?.pin,
             };
             send::send(&to, &send::expand(&files), &pin, secs(wait)).await
+        }
+
+        Cmd::Qr => {
+            let cfg = Config::load()?;
+            // Ask the daemon for the tunnel URL; fall back to the LAN address
+            // when it is off or unreachable.
+            let target = tray::public_url(cfg.port)
+                .await
+                .unwrap_or_else(|| cfg.local_url());
+            println!("  {target}");
+            println!("  PIN {}", cfg.pin);
+            tray::show_qr(&target, &cfg.pin)
         }
 
         Cmd::Status => {

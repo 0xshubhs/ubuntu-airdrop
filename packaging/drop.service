@@ -10,13 +10,11 @@ ExecStart=/usr/bin/drop serve
 Restart=on-failure
 RestartSec=3
 
-# The daemon only ever needs the user's own files.
+# This is a --user unit, so it cannot manipulate the capability bounding set.
+# PrivateDevices / ProtectKernelTunables / ProtectControlGroups all imply that
+# and fail with 218/CAPABILITIES before the binary ever runs. NoNewPrivileges
+# is the one that works unprivileged.
 NoNewPrivileges=true
-PrivateDevices=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictNamespaces=true
-RestrictRealtime=true
 
 [Install]
 WantedBy=default.target

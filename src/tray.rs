@@ -125,22 +125,14 @@ impl Tray for DropTray {
             .into(),
         );
 
-        let local = s.local_url.clone();
-        items.push(
-            StandardItem {
-                label: local.clone(),
-                activate: Box::new(move |_: &mut Self| copy(&local)),
-                ..Default::default()
-            }
-            .into(),
-        );
-
+        // Whichever address actually works from where the phone is wins the
+        // top slot. A LAN IP is useless on mobile data.
         match &s.tunnel_url {
             Some(url) => {
                 let u = url.clone();
                 items.push(
                     StandardItem {
-                        label: format!("Internet: {}", short(&u)),
+                        label: format!("Anywhere:  {}", short(&u)),
                         activate: Box::new(move |_: &mut Self| copy(&u)),
                         ..Default::default()
                     }
@@ -149,7 +141,7 @@ impl Tray for DropTray {
             }
             None if s.tunnel_enabled => items.push(
                 StandardItem {
-                    label: "Internet: starting…".into(),
+                    label: "Anywhere:  starting…".into(),
                     enabled: false,
                     ..Default::default()
                 }
@@ -158,12 +150,28 @@ impl Tray for DropTray {
             None => {}
         }
 
-        let qr_target = s.tunnel_url.clone().unwrap_or_else(|| s.local_url.clone());
+        let local = s.local_url.clone();
         items.push(
             StandardItem {
-                label: "Show QR code…".into(),
+                label: format!("This network only:  {local}"),
+                activate: Box::new(move |_: &mut Self| copy(&local)),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        let qr_target = s.tunnel_url.clone().unwrap_or_else(|| s.local_url.clone());
+        let qr_pin = s.pin.clone();
+        let qr_is_public = s.tunnel_url.is_some();
+        items.push(
+            StandardItem {
+                label: if qr_is_public {
+                    "Show QR code…".into()
+                } else {
+                    "Show QR code (this network)…".to_string()
+                },
                 activate: Box::new(move |_: &mut Self| {
-                    if let Err(e) = show_qr(&qr_target) {
+                    if let Err(e) = show_qr(&qr_target, &qr_pin) {
                         eprintln!("qr: {e}");
                     }
                 }),
@@ -342,23 +350,87 @@ fn copy(text: &str) {
     }
 }
 
-/// Render the URL as an SVG QR and hand it to the desktop's image viewer.
-fn show_qr(url: &str) -> Result<()> {
-    use qrcode::render::svg;
-    use qrcode::QrCode;
+/// Draw the QR, the PIN and the URL into one image.
+///
+/// Built by hand rather than with `qrcode`'s SVG renderer so the PIN can sit
+/// under the code — scanning and typing happen in the same glance.
+///
+/// This opens in whatever views images. gnome-shell draws the tray menu over
+/// D-Bus, which carries labels and checkboxes but not bitmaps, and Wayland
+/// won't let a client place a window next to the panel — so a popup anchored
+/// to the icon isn't on the table.
+pub fn show_qr(url: &str, pin: &str) -> Result<()> {
+    use qrcode::{Color, QrCode};
+
+    const MODULE: usize = 8;
+    const QUIET: usize = 4;
+    const PAD: usize = 24;
 
     let code = QrCode::new(url.as_bytes())?;
-    let svg = code
-        .render()
-        .min_dimensions(320, 320)
-        .dark_color(svg::Color("#000000"))
-        .light_color(svg::Color("#ffffff"))
-        .build();
+    let modules = code.width();
+    let colors = code.to_colors();
+
+    let qr_px = (modules + QUIET * 2) * MODULE;
+    let width = qr_px + PAD * 2;
+    let caption = 92;
+    let height = qr_px + PAD * 2 + caption;
+
+    let mut svg = String::with_capacity(modules * modules * 48);
+    svg.push_str(&format!(
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">"##
+    ));
+    svg.push_str(&format!(
+        r##"<rect width="{width}" height="{height}" fill="#ffffff"/>"##
+    ));
+
+    for (i, color) in colors.iter().enumerate() {
+        if *color != Color::Dark {
+            continue;
+        }
+        let x = (i % modules + QUIET) * MODULE + PAD;
+        let y = (i / modules + QUIET) * MODULE + PAD;
+        svg.push_str(&format!(
+            r##"<rect x="{x}" y="{y}" width="{MODULE}" height="{MODULE}" fill="#000000"/>"##
+        ));
+    }
+
+    let mid = width / 2;
+    let pin_y = qr_px + PAD + 30;
+    svg.push_str(&format!(
+        r##"<text x="{mid}" y="{pin_y}" text-anchor="middle" font-family="monospace" font-size="34" font-weight="bold" letter-spacing="6" fill="#16181A">{}</text>"##,
+        xml_escape(pin)
+    ));
+    svg.push_str(&format!(
+        r##"<text x="{mid}" y="{}" text-anchor="middle" font-family="monospace" font-size="13" fill="#6E6C66">{}</text>"##,
+        pin_y + 26,
+        xml_escape(url)
+    ));
+    svg.push_str("</svg>");
 
     let path = std::env::temp_dir().join("drop-qr.svg");
     std::fs::write(&path, svg)?;
     Command::new("xdg-open").arg(&path).spawn()?;
     Ok(())
+}
+
+fn xml_escape(raw: &str) -> String {
+    raw.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// The tunnel URL, if the daemon is up and the tunnel is running.
+pub async fn public_url(port: u16) -> Option<String> {
+    let status: Status = reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{port}/api/status"))
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok()?
+        .json()
+        .await
+        .ok()?;
+    status.tunnel_url
 }
 
 pub async fn run(port: u16) -> Result<()> {
