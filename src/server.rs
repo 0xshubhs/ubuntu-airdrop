@@ -590,6 +590,31 @@ async fn panel(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Response {
     Html(crate::panel::PANEL.to_string()).into_response()
 }
 
+async fn popover(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    (
+        [(header::CACHE_CONTROL, "no-store")],
+        Html(crate::popover::POPOVER.to_string()),
+    )
+        .into_response()
+}
+
+/// The popover's "open full window" button, so it does not need to know how
+/// to launch a browser itself.
+async fn open_window(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let port = app.cfg.read().await.port;
+    let _ = crate::panel::open(port);
+    Json(json!({"ok": true})).into_response()
+}
+
 async fn panel_qr(
     State(app): State<Arc<App>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -829,6 +854,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/files/{fname}", get(download))
         .route("/api/status", get(status))
         .route("/panel", get(panel))
+        .route("/popover", get(popover))
+        .route("/api/control/window", post(open_window))
         .route("/panel/qr.svg", get(panel_qr))
         .route("/api/control/open", post(open_folder))
         .route("/api/control/auto-move", post(set_auto_move))

@@ -250,9 +250,13 @@ impl Tray for DropTray {
                 } else {
                     "Show QR code (this network)…".to_string()
                 },
-                activate: Box::new(move |_: &mut Self| {
-                    if let Err(e) = show_qr(&qr_target, &qr_pin) {
-                        eprintln!("qr: {e}");
+                activate: Box::new(move |this: &mut Self| {
+                    // Under the icon if we can position a window; otherwise
+                    // fall back to handing the image to a viewer.
+                    if crate::popover::open(this.port, false).is_err() {
+                        if let Err(e) = show_qr(&qr_target, &qr_pin) {
+                            eprintln!("qr: {e}");
+                        }
                     }
                 }),
                 ..Default::default()
@@ -536,7 +540,10 @@ pub async fn run(port: u16) -> Result<()> {
             match seen {
                 None => seen = Some(s.received),
                 Some(prev) if s.received > prev => {
-                    notify(s.received - prev, &s.dir);
+                    // Point at where the files actually are: with auto-move on
+                    // they never sit in the Drop folder.
+                    let landed = if s.auto_move { &s.move_target } else { &s.dir };
+                    notify(s.received - prev, landed);
                     seen = Some(s.received);
                 }
                 _ => {}
@@ -547,6 +554,9 @@ pub async fn run(port: u16) -> Result<()> {
             for offer in &s.offers {
                 if announced.insert(offer.id.clone()) {
                     notify_offer(offer, port);
+                    // Put the accept/decline buttons under the tray icon
+                    // rather than making the user go and find them.
+                    let _ = crate::popover::open(port, true);
                 }
             }
             announced.retain(|id| s.offers.iter().any(|o| &o.id == id));
@@ -633,11 +643,30 @@ fn notify_offer(offer: &PendingOffer, port: u16) {
 /// Shell out to `notify-send` rather than link a notification library:
 /// the blocking D-Bus clients panic when called from inside a tokio runtime.
 fn notify(count: u64, dir: &std::path::Path) {
+    let where_ = dir
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| dir.display().to_string());
     let body = match count {
-        1 => "1 new file in ".to_string() + &dir.display().to_string(),
-        n => format!("{n} new files in {}", dir.display()),
+        1 => format!("1 new file in {where_}"),
+        n => format!("{n} new files in {where_}"),
     };
-    let _ = Command::new("notify-send")
-        .args(["--app-name=Drop", "--icon=folder-download", "Drop", &body])
-        .spawn();
+
+    let dir = dir.to_path_buf();
+    std::thread::spawn(move || {
+        let out = Command::new("notify-send")
+            .args([
+                "--app-name=Drop",
+                "--icon=folder-download",
+                "--action=open=Open folder",
+                "Drop",
+                &body,
+            ])
+            .output();
+        if let Ok(out) = out {
+            if String::from_utf8_lossy(&out.stdout).trim() == "open" {
+                let _ = Command::new("xdg-open").arg(&dir).spawn();
+            }
+        }
+    });
 }

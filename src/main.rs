@@ -7,6 +7,7 @@ mod net;
 mod offers;
 mod page;
 mod panel;
+mod popover;
 mod qr;
 mod send;
 mod server;
@@ -58,6 +59,8 @@ enum Cmd {
     },
     /// Open the Drop window
     Panel,
+    /// Open the small popover under the tray icon
+    Popover,
     /// Show the QR code and PIN for pairing a phone
     Qr,
     /// Open the Drop folder in the file manager
@@ -136,6 +139,12 @@ async fn main() -> Result<()> {
             let cfg = Config::load()?;
             tray::ensure_daemon();
             panel::open(cfg.port)
+        }
+
+        Cmd::Popover => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            popover::open(cfg.port, false)
         }
 
         Cmd::Qr => {

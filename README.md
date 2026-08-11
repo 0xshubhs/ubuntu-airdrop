@@ -131,10 +131,17 @@ from the sofa and nowhere else. *Anywhere* appears only once the tunnel is runni
 the one to use from mobile data. The QR always encodes whichever is the more reachable of
 the two, and prints the PIN underneath it.
 
-The QR opens in an image viewer rather than inside the menu. gnome-shell draws the tray
-menu over the StatusNotifierItem D-Bus protocol, which carries labels, checkmarks and
-small icons but not arbitrary images — and Wayland does not let a client position a window
-against the panel. `drop qr` shows the same thing from a terminal.
+**Show QR code** opens a small window directly under the tray icon, and an incoming
+transfer raises the same window by itself with Accept and Decline in it — so a decision
+never means going to find the app.
+
+It cannot literally live inside the dropdown: gnome-shell draws that menu itself over the
+StatusNotifierItem D-Bus protocol, which carries labels and checkmarks but not images or
+buttons. What it can be is a window in the right place. Wayland forbids a client
+positioning itself, but XWayland does not, and Chromium-family browsers take
+`--window-position`, so the popover is an `--app` window placed at the corner of the
+primary display read from `xrandr`. Without such a browser it falls back to handing the
+QR image to a viewer. `drop popover` opens it from a terminal.
 
 ## CLI
 
