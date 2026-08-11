@@ -164,77 +164,132 @@ picker.addEventListener('change', () => upload(picker.files));
 }));
 zone.addEventListener('drop', e => upload(e.dataTransfer.files));
 
-function upload(list){
-  if (!list || !list.length) return;
-  const form = new FormData();
-  for (const f of list) form.append('files', f, f.name);
-  const xhr = new XMLHttpRequest();
-  xhr.open('POST', '/api/upload');
-  xhr.upload.onprogress = e => {
-    if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%';
-  };
-  xhr.onload = () => {
-    bar.style.width = '0'; picker.value = '';
-    if (xhr.status === 401) { showGate('Session expired. Enter the PIN again.'); return; }
-    // 202: the receiver has the bytes but has not accepted them yet.
-    if (xhr.status === 202) {
-      let id = null;
-      try { id = JSON.parse(xhr.responseText).offer; } catch {}
-      waitForApproval(id);
-      return;
-    }
-    if (xhr.status !== 200) { alert('Transfer failed: ' + xhr.status); return; }
-    refresh();
-  };
-  xhr.onerror = () => { bar.style.width = '0'; alert('Lost connection during transfer.'); };
-  xhr.send(form);
+// What the receiver sees on the accept prompt.
+function deviceName(){
+  const saved = localStorage.getItem('drop-device');
+  if (saved) return saved;
+  const ua = navigator.userAgent;
+  if (/iPhone/.test(ua))     return 'iPhone';
+  if (/iPad/.test(ua))       return 'iPad';
+  if (/Android/.test(ua))    return 'Android phone';
+  if (/Macintosh/.test(ua))  return 'Mac';
+  if (/Windows/.test(ua))    return 'Windows PC';
+  if (/Linux/.test(ua))      return 'Linux PC';
+  return 'Browser';
 }
 
-// Follow one offer to its verdict, so the sender sees what actually happened
-// rather than a status code.
-function waitForApproval(id){
-  const box = $('#held'), title = $('#held-title'), sub = $('#held-sub');
+function held(cls, head, tail){
+  const box = $('#held');
   box.hidden = false;
-  box.className = 'wait';
-  title.textContent = 'Waiting to be accepted';
-  sub.textContent = 'The other device has to approve this transfer.';
+  box.className = cls;
+  $('#held-title').textContent = head;
+  $('#held-sub').textContent = tail;
+}
+function hideHeld(after){
+  setTimeout(() => { $('#held').hidden = true; $('#held').className = ''; }, after);
+}
 
-  const settle = (cls, head, tail, keep) => {
-    box.className = cls;
-    title.textContent = head;
-    sub.textContent = tail;
-    refresh();
-    setTimeout(() => { box.hidden = true; box.className = ''; }, keep);
-  };
+function human(n){
+  if (n < 1024) return n + ' B';
+  const u = ['KB','MB','GB']; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(1) + ' ' + u[i];
+}
 
-  // No id means an older receiver: fall back to a plain notice.
-  if (!id){
-    setTimeout(() => { box.hidden = true; refresh(); }, 4000);
+// Announce first, transfer second. The bytes must not move until the other
+// end has said yes — otherwise a large video is uploaded in full only to be
+// thrown away, which is what this whole flow exists to avoid.
+async function upload(list){
+  if (!list || !list.length) return;
+  const files = Array.from(list);
+  const total = files.reduce((a, f) => a + f.size, 0);
+  picker.value = '';
+
+  held('wait', 'Asking permission',
+       files.length + (files.length === 1 ? ' file' : ' files') + ' · ' + human(total));
+
+  let offer;
+  try {
+    const r = await fetch('/api/offer', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        device: deviceName(),
+        files: files.map(f => ({name: f.name, size: f.size})),
+      }),
+    });
+    if (r.status === 401) { $('#held').hidden = true; showGate('Session expired. Enter the PIN again.'); return; }
+    if (!r.ok) { held('no', 'Could not start', 'The receiver said ' + r.status + '.'); hideHeld(6000); return; }
+    offer = await r.json();
+  } catch {
+    held('no', 'Could not reach the receiver', 'Check that both devices are on.');
+    hideHeld(6000);
     return;
   }
 
-  let ticks = 0;
-  const timer = setInterval(async () => {
-    if (++ticks > 200){                       // ~5 min, past the offer TTL
-      clearInterval(timer);
-      settle('no', 'No response', 'The transfer expired without an answer.', 6000);
+  held('wait', 'Waiting to be accepted',
+       files.length + (files.length === 1 ? ' file' : ' files') + ' · ' + human(total));
+
+  const verdict = await awaitVerdict(offer.id);
+  if (verdict === 'accepted' || verdict === 'complete'){
+    held('wait', 'Sending', human(total));
+    sendBytes(files, offer.id, total);
+  } else if (verdict === 'declined'){
+    held('no', 'Declined', 'The other device turned this transfer down.');
+    hideHeld(6000);
+  } else {
+    held('no', 'No response', 'The transfer expired without an answer.');
+    hideHeld(6000);
+  }
+}
+
+// Poll until the receiver decides. Resolves with the final status.
+function awaitVerdict(id){
+  return new Promise(resolve => {
+    let ticks = 0;
+    const timer = setInterval(async () => {
+      if (++ticks > 200){ clearInterval(timer); resolve('expired'); return; }
+      let s;
+      try { s = await (await fetch('/api/offer/' + encodeURIComponent(id))).json(); }
+      catch { return; }
+      if (s.status && s.status !== 'pending'){ clearInterval(timer); resolve(s.status); }
+    }, 1200);
+  });
+}
+
+// Only now do the bytes leave the device.
+function sendBytes(files, id, total){
+  const form = new FormData();
+  for (const f of files) form.append('files', f, f.name);
+
+  const xhr = new XMLHttpRequest();
+  xhr.open('POST', '/api/upload?offer=' + encodeURIComponent(id));
+  xhr.setRequestHeader('X-Drop-Device', deviceName());
+  xhr.upload.onprogress = e => {
+    if (!e.lengthComputable) return;
+    bar.style.width = (e.loaded / e.total * 100) + '%';
+    held('wait', 'Sending', human(e.loaded) + ' of ' + human(total));
+  };
+  xhr.onload = () => {
+    bar.style.width = '0';
+    if (xhr.status === 401) { $('#held').hidden = true; showGate('Session expired. Enter the PIN again.'); return; }
+    if (xhr.status === 403) { held('no', 'Declined', 'The transfer was turned down.'); hideHeld(6000); return; }
+    if (xhr.status !== 200 && xhr.status !== 202) {
+      held('no', 'Transfer failed', 'The receiver said ' + xhr.status + '.');
+      hideHeld(6000);
       return;
     }
-    let s;
-    try { s = await (await fetch('/api/offer/' + encodeURIComponent(id))).json(); }
-    catch { return; }
-
-    if (s.status === 'accepted' || s.status === 'complete'){
-      clearInterval(timer);
-      settle('yes', 'Accepted', 'Your files are on the other device.', 4000);
-    } else if (s.status === 'declined'){
-      clearInterval(timer);
-      settle('no', 'Declined', 'The other device turned this transfer down.', 6000);
-    } else if (s.status === 'expired'){
-      clearInterval(timer);
-      settle('no', 'No response', 'The transfer expired without an answer.', 6000);
-    }
-  }, 1500);
+    held('yes', 'Sent', 'Your files are on the other device.');
+    hideHeld(4000);
+    refresh();
+  };
+  xhr.onerror = () => {
+    bar.style.width = '0';
+    held('no', 'Connection lost',
+         'The transfer stopped part way. Large files over the internet tunnel are capped at 100 MB.');
+    hideHeld(9000);
+  };
+  xhr.send(form);
 }
 
 async function refresh(){

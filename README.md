@@ -65,8 +65,9 @@ There are two ways in, because an iOS Shortcut can only make **one** HTTP reques
 cannot offer, wait, then upload:
 
 - **Negotiated** — `POST /api/offer` with the file list, wait for the verdict, then
-  `POST /api/upload?offer=<id>`. Not a byte is transferred before you accept. This is what
-  `drop send` and the web page use, so Linux-to-Linux works this way too.
+  `POST /api/upload?offer=<id>`. Not a byte is transferred before you accept. The web page
+  and `drop send` both work this way, so the prompt for an 80 MB video appears as fast as
+  for a text file — the announce carries names and sizes only, and measures ~17 ms.
 - **Staged** — a one-shot `POST /api/upload`. The bytes stream into a hidden
   `.staging/` folder inside the Drop directory and an offer is raised for them. They only
   become visible on Accept, and are deleted on Decline. The sender gets `202` rather
