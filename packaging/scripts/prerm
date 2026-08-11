@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    remove|deconfigure)
+        systemctl --global disable drop.service >/dev/null 2>&1 || true
+        # Config and received files are the user's; leave both alone.
+        ;;
+esac
+
+exit 0

@@ -1,0 +1,53 @@
+[package]
+name = "drop"
+version = "0.1.0"
+edition = "2024"
+description = "AirDrop-ish file transfer for your own LAN"
+license = "MIT"
+repository = "https://github.com/0xshubhs/ubuntu-airdrop"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[package.metadata.deb]
+maintainer = "Shubham Tiwari <shubht3303@gmail.com>"
+copyright = "2026, Shubham Tiwari"
+section = "utils"
+priority = "optional"
+extended-description = """\
+Receive files from an iPhone, a Mac or another Linux box over your own network.
+Devices find each other with mDNS; transfers are HTTP multipart guarded by a PIN.
+Ships a desktop indicator that shows the PIN, a QR code, and what has arrived.
+Optionally reachable from outside the LAN through a Cloudflare tunnel."""
+depends = "$auto"
+recommends = "libnotify-bin, avahi-daemon, wl-clipboard"
+suggests = "cloudflared"
+maintainer-scripts = "packaging/scripts"
+assets = [
+    ["target/release/drop", "usr/bin/", "755"],
+    ["packaging/drop.service", "usr/lib/systemd/user/drop.service", "644"],
+    ["packaging/drop-tray.desktop", "etc/xdg/autostart/drop-tray.desktop", "644"],
+    ["README.md", "usr/share/doc/drop/README.md", "644"],
+]
+
+[dependencies]
+anyhow = "1.0.104"
+axum = { version = "0.8.9", features = ["multipart"] }
+clap = { version = "4.6.6", features = ["derive"] }
+dirs = "6.0.0"
+getrandom = "0.4.3"
+hex = "0.4.3"
+hmac = "0.13.0"
+ksni = "0.3.6"
+mdns-sd = "0.20.3"
+qrcode = "0.14.1"
+reqwest = { version = "0.13.4", default-features = false, features = ["multipart", "json"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "io-util", "signal", "process", "time", "sync"] }
+tokio-util = { version = "0.7.19", features = ["io"] }

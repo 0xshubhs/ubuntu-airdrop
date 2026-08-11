@@ -3,3 +3,8 @@ __pycache__/
 .venv/
 venv/
 *.log
+
+
+# Added by cargo
+
+/target

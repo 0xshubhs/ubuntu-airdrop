@@ -1,0 +1,22 @@
+[Unit]
+Description=Drop - LAN file transfer
+Documentation=https://github.com/0xshubhs/ubuntu-airdrop
+After=network-online.target avahi-daemon.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/drop serve
+Restart=on-failure
+RestartSec=3
+
+# The daemon only ever needs the user's own files.
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=default.target

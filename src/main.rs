@@ -1,0 +1,161 @@
+//! Drop — AirDrop-ish file transfer for your own LAN.
+
+mod auth;
+mod config;
+mod discovery;
+mod net;
+mod page;
+mod send;
+mod server;
+mod tray;
+mod tunnel;
+
+use anyhow::Result;
+use clap::{Parser, Subcommand};
+use config::Config;
+use std::time::Duration;
+
+#[derive(Parser)]
+#[command(name = "drop", version, about = "AirDrop-ish file transfer over your LAN")]
+struct Cli {
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Receive files (this is what the systemd service runs)
+    Serve {
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+        /// Fixed PIN instead of the stored one
+        #[arg(long)]
+        pin: Option<String>,
+    },
+    /// Show the indicator in the top-right of the desktop
+    Tray,
+    /// List devices advertising right now
+    Peers {
+        #[arg(long, default_value = "2")]
+        wait: f32,
+    },
+    /// Push files to a peer
+    Send {
+        /// Peer name, IP, or host:port
+        to: String,
+        files: Vec<String>,
+        #[arg(long)]
+        pin: Option<String>,
+        #[arg(long, default_value = "2")]
+        wait: f32,
+    },
+    /// Print this device's PIN and address
+    Status,
+    /// Generate a new PIN, invalidating existing sessions
+    Pin,
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    match cli.cmd {
+        Cmd::Serve {
+            port,
+            name,
+            dir,
+            pin,
+        } => {
+            let mut cfg = Config::load()?;
+            if let Some(p) = port {
+                cfg.port = p;
+            }
+            if let Some(n) = name {
+                cfg.name = n;
+            }
+            if let Some(d) = dir {
+                cfg.dir = d;
+            }
+            if let Some(p) = pin {
+                cfg.pin = p;
+            }
+            cfg.save()?;
+            server::serve(cfg).await
+        }
+
+        Cmd::Tray => {
+            let cfg = Config::load()?;
+            tray::run(cfg.port).await
+        }
+
+        Cmd::Peers { wait } => {
+            let me = config::hostname();
+            println!("listening for {wait:.0}s ...");
+            let peers = discovery::snapshot(me, secs(wait)).await?;
+            if peers.is_empty() {
+                println!("nothing found. is drop running on the other machine?");
+            }
+            for p in peers {
+                println!("  {:<22} {}:{}", p.label, p.host, p.port);
+            }
+            Ok(())
+        }
+
+        Cmd::Send {
+            to,
+            files,
+            pin,
+            wait,
+        } => {
+            if files.is_empty() {
+                anyhow::bail!("give me at least one file");
+            }
+            // Without --pin, assume the peer shares our PIN (common when both
+            // ends are yours); otherwise the receiver rejects it and says so.
+            let pin = match pin {
+                Some(p) => p,
+                None => Config::load()?.pin,
+            };
+            send::send(&to, &send::expand(&files), &pin, secs(wait)).await
+        }
+
+        Cmd::Status => {
+            let cfg = Config::load()?;
+            println!("  {}", cfg.name);
+            println!("  {}", cfg.local_url());
+            println!("  saving to {}", cfg.dir.display());
+            println!("  PIN {}", cfg.pin);
+            println!(
+                "  auto-move  {}",
+                if cfg.auto_move {
+                    format!("on -> {}", cfg.move_target.display())
+                } else {
+                    "off".into()
+                }
+            );
+            println!(
+                "  tunnel     {}",
+                if cfg.tunnel { "on" } else { "off" }
+            );
+            Ok(())
+        }
+
+        Cmd::Pin => {
+            let mut cfg = Config::load()?;
+            cfg.pin = config::random_pin();
+            cfg.secret = config::random_hex(32);
+            cfg.save()?;
+            println!("  PIN {}", cfg.pin);
+            println!("  restart the daemon: systemctl --user restart drop");
+            Ok(())
+        }
+    }
+}
+
+fn secs(v: f32) -> Duration {
+    Duration::from_millis((v.max(0.1) * 1000.0) as u64)
+}

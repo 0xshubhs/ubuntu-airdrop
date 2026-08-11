@@ -1,14 +1,16 @@
 # ubuntu-airdrop
 
-AirDrop for the rest of us. Push files from an iPhone or a Mac to an Ubuntu box —
-straight from the iOS Share Sheet and the Finder right-click menu, no cloud in between.
+AirDrop-ish file transfer for your own network. Push files from an iPhone, a Mac, or
+another Linux box to Ubuntu — with a desktop indicator that shows the PIN, a QR code,
+and what just arrived.
 
-Three moving parts:
+A single 3 MB Rust binary. One dependency: `libc6`.
 
 ```
-  advertise  ──▶  _mydrop._tcp.local.   (zeroconf / Avahi / Bonjour)
-  discover   ──▶  browse the same service type, collect host:port
+  advertise  ──▶  _mydrop._tcp.local.      (mDNS / Avahi / Bonjour)
+  discover   ──▶  browse the same type, collect host:port
   transfer   ──▶  POST /api/upload, multipart, streamed to disk
+  reach      ──▶  optional Cloudflare tunnel for off-LAN
 ```
 
 ---
@@ -16,80 +18,103 @@ Three moving parts:
 ## Install
 
 ```bash
-git clone https://github.com/0xshubhs/ubuntu-airdrop.git
-cd ubuntu-airdrop
-./install.sh --pin 314159
+sudo dpkg -i drop_0.1.0-1_amd64.deb
 ```
 
-That one script:
-
-- builds a venv at `~/.venvs/drop` with `fastapi uvicorn python-multipart zeroconf httpx`
-- drops a `drop` launcher into `~/.local/bin`
-- installs a **systemd user service**, enables it, and turns on lingering — so the
-  receiver comes up at boot, before you log in, and stays up after you log out
-
-Pass a fixed `--pin` so the iPhone shortcut keeps working across restarts. Leave it off
-and you get a random one each install.
-
-If `ufw` is running, open the ports:
+Then, without logging out:
 
 ```bash
-sudo ufw allow 8420/tcp
-sudo ufw allow 5353/udp     # mDNS
+systemctl --user start drop
+/usr/bin/drop tray &
 ```
 
-Uninstall with `./install.sh --uninstall`. Your files in `~/Drop` are left alone.
+The package enables the service for every user (`systemctl --global enable`) and drops a
+desktop-autostart entry for the tray, so from your next login both come up on their own.
 
-## Use it
+To keep receiving while logged out and from boot:
 
 ```bash
-systemctl --user status drop     # is the receiver up?
-journalctl --user -u drop -f     # watch files land
-drop peers                       # who else is advertising
-drop send thinkpad ~/Pictures/*.jpg
-drop send 192.168.1.31 report.pdf
+sudo loginctl enable-linger $USER
 ```
 
-The receiver prints its address on start:
+### Build it yourself
 
-```
-  Drop  —  keshava
-  http://192.168.0.113:8420
-  saving to /home/you/Drop
-  PIN 314159
+```bash
+cargo build --release          # binary at target/release/drop
+cargo deb                      # package at target/debian/
 ```
 
-Open that URL on any device on the network and you get a drag-and-drop page. That alone
-already solves iPhone → Ubuntu.
+## The indicator
 
-**Prefer `http://<hostname>.local:8420` over the raw IP.** Avahi publishes it, iOS and
-macOS resolve it natively, and it survives your laptop moving between Wi-Fi and Ethernet
-or getting a new DHCP lease. The hardcoded IP does not.
+Click the Drop icon in the top-right:
 
-## iPhone: put it in the Share Sheet
+```
+  Receiving as "keshava"
+  ─────────────────────────
+  PIN  481902                   ← click to copy
+  http://192.168.0.113:8420     ← click to copy
+  Internet: xyz.trycloudflare.com
+  Show QR code…                 ← scan from the phone
+  ─────────────────────────
+  3 files waiting
+  1 other device nearby
+  Open Drop folder
+  Move all to Downloads
+  ☐ Always move to Downloads
+  ─────────────────────────
+  ☐ Reachable from the internet
+  New PIN
+  Quit
+```
 
-This is the piece that makes it feel like AirDrop instead of like a website.
+**Always move to Downloads** is the auto-file option: each finished transfer is moved out
+of `~/Drop` into `~/Downloads` the moment it lands, so the Drop folder stays empty.
+**Move all to Downloads** does the same on demand. Moves fall back to copy-then-delete
+across filesystems.
 
-1. Open **Shortcuts** → **+** → rename it `Drop to Ubuntu`.
-2. Tap the ⓘ info button → turn on **Show in Share Sheet**.
-3. Under *Share Sheet Types*, deselect everything except **Files, Images, Media, URLs**.
-4. Add action **Get Contents of URL**:
-   - URL: `http://keshava.local:8420/api/upload`  *(your hostname)*
-   - Method: **POST**
-   - Headers: add `X-Drop-Pin` = your PIN
-   - Request Body: **Form**
-   - Add field → type **File** → key `files` → value **Shortcut Input**
-5. Done.
+## CLI
 
-Now: any photo, any file, any webpage → Share → *Drop to Ubuntu*. Two taps.
+```bash
+drop status                     # PIN, address, current settings
+drop peers                      # other devices advertising
+drop send thinkpad ~/photo.jpg  # push to a peer by name, IP, or host:port
+drop pin                        # new PIN, invalidates live sessions
+drop serve                      # run the daemon in the foreground
+drop tray                       # run the indicator
 
-First run, iOS asks for **Local Network** permission — allow it, or the request fails
-with nothing useful in the log. Settings → Shortcuts → Local Network if you missed it.
+systemctl --user status drop
+journalctl --user -u drop -f    # watch files land
+```
 
-## macOS: a Quick Action in Finder
+## iPhone: the Share Sheet
 
-**Automator** → new **Quick Action** → *Workflow receives files or folders in Finder* →
-add **Run Shell Script**, set *Pass input* to **as arguments**:
+1. **Shortcuts** → **+** → name it `Drop to Ubuntu`.
+2. ⓘ → **Show in Share Sheet**. Under *Share Sheet Types* keep only **Files, Images,
+   Media, URLs**.
+3. Add **Get Contents of URL**:
+   - URL: `http://keshava.local:8420/api/upload` *(your hostname)*
+   - Method **POST**
+   - Header `X-Drop-Pin` = your PIN
+   - Request Body **Form** → add field, type **File**, key `files`, value **Shortcut Input**
+
+Any photo, file, or webpage → Share → *Drop to Ubuntu*.
+
+Two things that bite:
+
+- On first run iOS asks for **Local Network** permission. Deny it and the request fails
+  with nothing useful in the log. Settings → Shortcuts → Local Network.
+- Prefer `http://<hostname>.local:8420` over a hardcoded IP — it survives the laptop
+  moving between Wi-Fi and Ethernet, or getting a new DHCP lease.
+
+This will never appear in the iPhone's **AirDrop** list. AirDrop is AWDL, a proprietary
+Apple radio protocol; the only open implementation needs a Wi-Fi card with raw frame
+injection (Broadcom/nexmon, some Atheros) and is broken against current iOS. The Share
+Sheet entry sits one row below the AirDrop row, and that is the ceiling on Linux.
+
+## macOS: a Finder Quick Action
+
+**Automator** → **Quick Action** → *receives files or folders in Finder* → **Run Shell
+Script**, *Pass input* as **arguments**:
 
 ```bash
 for f in "$@"; do
@@ -98,41 +123,60 @@ for f in "$@"; do
 done
 ```
 
-Save as `Drop to Ubuntu`. It now appears in Finder's right-click menu and in Services.
-Bind a hotkey to it in System Settings → Keyboard → Shortcuts.
+Bind a hotkey in System Settings → Keyboard → Shortcuts.
 
----
+## Reaching it from outside the LAN
 
-## Known gaps
+Tick **Reachable from the internet** and the daemon starts a Cloudflare quick tunnel
+(`cloudflared` must be installed; no Cloudflare account needed) and shows the public
+`https://…trycloudflare.com` URL in the menu. Quick-tunnel hostnames are random and
+change on every restart, which is why the menu offers a QR code instead of asking you to
+type one.
 
-**The PIN only guards uploads.** `GET /api/state` and `GET /files/<name>` are wide open
-to anyone on the LAN — they can list and download everything already in `~/Drop`. Fine
-on your own network, not fine on café Wi-Fi.
+**This puts your receiver on the public internet.** The PIN is then the only thing in
+front of your Drop folder, so:
 
-**No TLS.** Transfers are plaintext HTTP. Anyone on the same network can read them.
+- every route is gated — page, listing, uploads, downloads
+- a wrong PIN costs the caller an exponential lockout, from 30 s up to 15 min, per IP
+- sessions are HMAC-signed cookies; `New PIN` rotates the signing key and logs everyone out
+
+Off by default. Leave it off unless you need it.
+
+## Security notes
+
+Auth is a six-digit PIN, sent either as `X-Drop-Pin` (Shortcuts, `curl`) or exchanged for
+a signed session cookie (browser). Every route except the PIN prompt itself requires it.
+Control endpoints (`/api/status`, `/api/control/*`) additionally refuse anything that is
+not loopback, so the tray can drive them but the network cannot.
+
+Uploaded filenames are stripped to their final path component and sanitised, and
+downloads are canonicalised and confirmed to be inside the Drop folder before opening.
+
+**Transfers are plaintext HTTP on the LAN.** Anyone on the same network can read them.
+Through the tunnel they are HTTPS to Cloudflare, which terminates TLS and can see them.
 
 ## Where to take it next
 
-Roughly in order of payoff:
+**Sender identity, not just a PIN.** A keypair per device, fingerprint in the mDNS TXT
+record, signed uploads — then the receiver can ask *"Accept 3 files from iPhone?"* and
+remember the answer. That is the real AirDrop model.
 
-**Sender identity, not just a PIN.** Right now anyone with the PIN can push. Replace it
-with a keypair per device: each device generates one on first run, publishes the
-fingerprint in the mDNS TXT record, and signs uploads. Then the receiver shows
-*"Accept 3 files from iPhone?"* and remembers the answer. That's the real AirDrop model.
+**TLS on the LAN.** Self-signed cert on first run, pinned by fingerprint on the sender.
+Ugly in Safari, correct.
 
-**TLS.** Self-signed cert generated on first run, pinned by fingerprint on the sender.
-Annoying in Safari (cert warnings) but correct.
+**Resume.** Content-hash the file, `HEAD /api/upload/<hash>` for how many bytes landed,
+then send a `Content-Range`. Matters as soon as you move video.
 
-**Resume.** Content-hash the file, `HEAD /api/upload/<hash>` to ask how many bytes the
-receiver already has, then send a `Content-Range`. Matters as soon as you move video.
+**Skip the router.** Both paths go through the access point. Wi-Fi Direct via
+`wpa_supplicant` P2P gets you a direct link between two Linux boxes; iOS won't join it.
 
-**Skip the router.** Both current paths go through the access point. Real AirDrop uses
-AWDL, a peer-to-peer link. The open equivalent is Wi-Fi Direct on Linux via
-`wpa_supplicant` P2P — you can get a direct link between two Linux boxes, though iOS
-won't join it. This is where the project gets genuinely hard, and also where it gets
-interesting.
+**Native iOS client.** `NWBrowser` to find `_mydrop._tcp` and `NWListener` to receive
+would close the loop — discovery, progress, and receiving, none of which a Shortcut can
+do. Needs a Mac and Xcode; free provisioning expires every 7 days.
 
-**Native iOS client.** The Shortcut has real limits: no discovery, no progress, no
-receiving. A small SwiftUI app using `NWBrowser` to find `_mydrop._tcp` and `NWListener`
-to receive would close the loop. Needs a Mac and Xcode; free provisioning works but the
-build expires every 7 days.
+---
+
+`legacy/` holds the original Python prototype (FastAPI + zeroconf) this replaced. It
+still works — `legacy/install.sh --pin 123456` — but needs four Python packages whose
+versions drift between Ubuntu releases, which is exactly why the shipping version is a
+single static binary.

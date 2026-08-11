@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=Drop
+GenericName=LAN file transfer
+Comment=Receive files from your phone and other devices
+Exec=/usr/bin/drop tray
+Icon=network-transmit-receive
+Terminal=false
+Categories=Utility;Network;FileTransfer;
+Keywords=airdrop;transfer;share;phone;
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3
+NoDisplay=true

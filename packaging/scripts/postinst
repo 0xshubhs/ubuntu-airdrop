@@ -1,0 +1,29 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Enable the user service for every user on the machine. Each user
+        # still gets their own PIN and their own Drop folder.
+        systemctl --global enable drop.service >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+
+        cat <<'EOF'
+
+  Drop installed.
+
+  Start it now without logging out:
+      systemctl --user start drop
+      /usr/bin/drop tray &
+
+  Then click the Drop icon in the top-right for your PIN, or run:
+      drop status
+
+  To keep receiving while logged out (and from boot):
+      sudo loginctl enable-linger $USER
+
+EOF
+        ;;
+esac
+
+exit 0
