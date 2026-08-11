@@ -21,15 +21,14 @@ A single 3 MB Rust binary. One dependency: `libc6`.
 sudo dpkg -i drop_0.1.0-1_amd64.deb
 ```
 
-Then, without logging out:
+That is the whole install. The icon appears in the top-right immediately — no logout, no
+follow-up commands, and the same on upgrade.
 
-```bash
-systemctl --user start drop
-/usr/bin/drop tray &
-```
-
-The package enables the service for every user (`systemctl --global enable`) and drops a
-desktop-autostart entry for the tray, so from your next login both come up on their own.
+`postinst` runs as root, so it finds logged-in users via `loginctl`, then re-enters each
+session with `runuser` and their `XDG_RUNTIME_DIR`/`DBUS_SESSION_BUS_ADDRESS` to restart
+the daemon and replace the tray. Without that env a `--user` unit has no instance to talk
+to and a tray has no bus to appear on. The service is also `systemctl --global enable`d and
+the tray has a desktop-autostart entry, which covers users who are not logged in yet.
 
 To keep receiving while logged out and from boot:
 

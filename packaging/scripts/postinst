@@ -1,23 +1,67 @@
 #!/bin/sh
 set -e
 
+# Restart Drop for a user who is logged in right now.
+#
+# This script runs as root, but the daemon and the tray are per-user things
+# living on that user's session bus — so everything has to be re-entered as
+# them, with XDG_RUNTIME_DIR and DBUS_SESSION_BUS_ADDRESS pointing at their
+# session. Without those, `systemctl --user` has no idea which instance to talk
+# to and the tray has no bus to appear on.
+refresh_user() {
+    _user="$1"
+    _uid="$2"
+    _run="/run/user/${_uid}"
+
+    # No runtime dir means no live session; the autostart entry and the
+    # globally-enabled service will pick it up at next login.
+    [ -d "$_run" ] || return 0
+
+    _env="XDG_RUNTIME_DIR=${_run} DBUS_SESSION_BUS_ADDRESS=unix:path=${_run}/bus"
+
+    # shellcheck disable=SC2086
+    runuser -u "$_user" -- env $_env systemctl --user daemon-reload >/dev/null 2>&1 || true
+    # shellcheck disable=SC2086
+    runuser -u "$_user" -- env $_env systemctl --user restart drop.service >/dev/null 2>&1 || true
+
+    # Replace the tray with the new binary. Kill first, then clear the
+    # singleton marker, or the fresh one decides it is a duplicate and exits.
+    pkill -u "$_uid" -f 'drop tray' >/dev/null 2>&1 || true
+    rm -f "${_run}/drop-tray.pid"
+
+    # Only worth starting if there is a session bus to register on.
+    if [ -S "${_run}/bus" ]; then
+        # shellcheck disable=SC2086
+        runuser -u "$_user" -- env $_env setsid /usr/bin/drop tray \
+            >/dev/null 2>&1 </dev/null &
+    fi
+}
+
 case "$1" in
     configure)
-        # Enable the user service for every user on the machine. Each user
-        # still gets their own PIN and their own Drop folder.
+        # Enable for every user. Each keeps their own PIN and Drop folder.
         systemctl --global enable drop.service >/dev/null 2>&1 || true
         systemctl daemon-reload >/dev/null 2>&1 || true
 
+        # Bring it up for anyone already logged in, so an upgrade takes effect
+        # without a logout.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl list-users --no-legend 2>/dev/null \
+            | while read -r uid user _; do
+                case "$uid" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                [ "$uid" -ge 1000 ] || continue
+                refresh_user "$user" "$uid" || true
+            done
+        fi
+
         cat <<'EOF'
 
-  Drop installed.
+  Drop is running. Click the icon in the top-right, or press Super and type "drop".
 
-  Start it now without logging out:
-      systemctl --user start drop
-      /usr/bin/drop tray &
-
-  Then click the Drop icon in the top-right for your PIN, or run:
-      drop status
+      drop status     PIN and address
+      drop qr         QR code to pair a phone
 
   To keep receiving while logged out (and from boot):
       sudo loginctl enable-linger $USER

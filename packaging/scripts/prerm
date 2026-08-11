@@ -4,6 +4,24 @@ set -e
 case "$1" in
     remove|deconfigure)
         systemctl --global disable drop.service >/dev/null 2>&1 || true
+
+        # Stop what is running now, per user, or the tray keeps a deleted
+        # binary alive until logout.
+        if command -v loginctl >/dev/null 2>&1; then
+            loginctl list-users --no-legend 2>/dev/null \
+            | while read -r uid user _; do
+                case "$uid" in
+                    ''|*[!0-9]*) continue ;;
+                esac
+                [ "$uid" -ge 1000 ] || continue
+                _run="/run/user/${uid}"
+                [ -d "$_run" ] || continue
+                runuser -u "$user" -- env "XDG_RUNTIME_DIR=${_run}" \
+                    systemctl --user stop drop.service >/dev/null 2>&1 || true
+                pkill -u "$uid" -f 'drop tray' >/dev/null 2>&1 || true
+                rm -f "${_run}/drop-tray.pid"
+            done
+        fi
         # Config and received files are the user's; leave both alone.
         ;;
 esac
