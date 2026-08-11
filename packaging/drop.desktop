@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Name=Drop
+GenericName=LAN file transfer
+Comment=Receive files from your phone and other devices
+Exec=/usr/bin/drop tray
+Icon=network-transmit-receive
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=airdrop;transfer;share;phone;qr;pin;send;
+StartupNotify=false
+Actions=qr;folder;
+
+[Desktop Action qr]
+Name=Show QR code and PIN
+Exec=/usr/bin/drop qr
+
+[Desktop Action folder]
+Name=Open Drop folder
+Exec=/usr/bin/drop open

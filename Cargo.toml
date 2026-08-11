@@ -31,6 +31,7 @@ assets = [
     ["target/release/drop", "usr/bin/", "755"],
     ["packaging/drop.service", "usr/lib/systemd/user/drop.service", "644"],
     ["packaging/drop-tray.desktop", "etc/xdg/autostart/drop-tray.desktop", "644"],
+    ["packaging/drop.desktop", "usr/share/applications/drop.desktop", "644"],
     ["README.md", "usr/share/doc/drop/README.md", "644"],
 ]
 

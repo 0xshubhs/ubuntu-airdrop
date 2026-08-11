@@ -433,7 +433,53 @@ pub async fn public_url(port: u16) -> Option<String> {
     status.tunnel_url
 }
 
+/// Only one tray may run, or the panel shows two icons.
+///
+/// Launching Drop from the app grid when it is already running is not an
+/// error — it means "show me the code", so the caller falls through to the QR.
+fn claim_singleton() -> bool {
+    let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".into());
+    let path = std::path::Path::new(&dir).join("drop-tray.pid");
+
+    if let Ok(existing) = std::fs::read_to_string(&path) {
+        if let Ok(pid) = existing.trim().parse::<u32>() {
+            // A stale PID file outlives a crash, so confirm the process is
+            // both alive and actually us.
+            if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{pid}/cmdline")) {
+                if cmdline.contains("drop") && cmdline.contains("tray") {
+                    return false;
+                }
+            }
+        }
+    }
+    let _ = std::fs::write(&path, std::process::id().to_string());
+    true
+}
+
+/// Bring the daemon up if it isn't. Launching the tray from the app grid
+/// should get you a working Drop, not an icon reporting a dead daemon.
+fn ensure_daemon() {
+    let active = Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "drop.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !active {
+        let _ = Command::new("systemctl")
+            .args(["--user", "start", "drop.service"])
+            .status();
+    }
+}
+
 pub async fn run(port: u16) -> Result<()> {
+    if !claim_singleton() {
+        // Already in the panel. Treat the launch as "show me the QR".
+        let cfg = crate::config::Config::load()?;
+        let target = public_url(port).await.unwrap_or_else(|| cfg.local_url());
+        return show_qr(&target, &cfg.pin);
+    }
+    ensure_daemon();
+
     let tray = DropTray {
         port,
         status: None,

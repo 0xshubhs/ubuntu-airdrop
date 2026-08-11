@@ -55,6 +55,8 @@ enum Cmd {
     },
     /// Show the QR code and PIN for pairing a phone
     Qr,
+    /// Open the Drop folder in the file manager
+    Open,
     /// Print this device's PIN and address
     Status,
     /// Generate a new PIN, invalidating existing sessions
@@ -135,6 +137,13 @@ async fn main() -> Result<()> {
             println!("  {target}");
             println!("  PIN {}", cfg.pin);
             tray::show_qr(&target, &cfg.pin)
+        }
+
+        Cmd::Open => {
+            let cfg = Config::load()?;
+            std::fs::create_dir_all(&cfg.dir)?;
+            std::process::Command::new("xdg-open").arg(&cfg.dir).spawn()?;
+            Ok(())
         }
 
         Cmd::Status => {
