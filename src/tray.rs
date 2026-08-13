@@ -503,26 +503,26 @@ pub fn ensure_daemon() {
     }
 }
 
-/// Keep trying to claim a spot in the status area.
+/// Claim a spot in the status area, however long the shell takes to show up.
 ///
-/// At login we are started seconds into the session, and the thing that owns
-/// `org.kde.StatusNotifierWatcher` — the AppIndicator shell extension — is
-/// usually not on the bus yet. One attempt loses that race and the icon never
-/// appears until the next manual start, so wait for the shell instead of
-/// giving up. Also covers the shell being restarted later.
+/// At login we start seconds into the session, before the AppIndicator
+/// extension owns `org.kde.StatusNotifierWatcher`. A plain spawn() loses that
+/// race, and the icon then stays missing for the whole session.
+///
+/// `assume_sni_available` turns that specific failure into a soft one: ksni
+/// stays alive, watches NameOwnerChanged for the watcher, and registers the
+/// moment it appears — which also covers the shell being restarted later.
+/// The retry below is only for the bus itself not being reachable yet.
 async fn attach(port: u16) -> Result<ksni::Handle<DropTray>> {
     let mut wait = Duration::from_millis(250);
     let deadline = std::time::Instant::now() + Duration::from_secs(300);
-    let mut last;
 
     loop {
         let tray = DropTray { port, status: None };
-        match tray.spawn().await {
+        match tray.assume_sni_available(true).spawn().await {
             Ok(handle) => return Ok(handle),
-            Err(e) => last = e,
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err(last.into());
+            Err(e) if std::time::Instant::now() >= deadline => return Err(e.into()),
+            Err(_) => {}
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(Duration::from_secs(5));
