@@ -4,6 +4,11 @@ Documentation=https://github.com/0xshubhs/ubuntu-airdrop
 After=network-online.target avahi-daemon.service
 Wants=network-online.target
 
+# Enabled globally, so the greeter (gdm, uid 975) gets a user manager that
+# tries to run this too. It then fights the real session for the port and
+# restart-loops until systemd gives up. Only humans receive files.
+ConditionUser=!@system
+
 [Service]
 Type=simple
 ExecStart=/usr/bin/drop serve

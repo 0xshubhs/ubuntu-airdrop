@@ -503,6 +503,32 @@ pub fn ensure_daemon() {
     }
 }
 
+/// Keep trying to claim a spot in the status area.
+///
+/// At login we are started seconds into the session, and the thing that owns
+/// `org.kde.StatusNotifierWatcher` — the AppIndicator shell extension — is
+/// usually not on the bus yet. One attempt loses that race and the icon never
+/// appears until the next manual start, so wait for the shell instead of
+/// giving up. Also covers the shell being restarted later.
+async fn attach(port: u16) -> Result<ksni::Handle<DropTray>> {
+    let mut wait = Duration::from_millis(250);
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    let mut last;
+
+    loop {
+        let tray = DropTray { port, status: None };
+        match tray.spawn().await {
+            Ok(handle) => return Ok(handle),
+            Err(e) => last = e,
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(last.into());
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(5));
+    }
+}
+
 pub async fn run(port: u16) -> Result<()> {
     if !claim_singleton() {
         // Already in the panel. Treat the launch as "show me the QR".
@@ -512,11 +538,7 @@ pub async fn run(port: u16) -> Result<()> {
     }
     ensure_daemon();
 
-    let tray = DropTray {
-        port,
-        status: None,
-    };
-    let handle = tray.spawn().await?;
+    let mut handle = attach(port).await?;
     let client = reqwest::Client::new();
     let endpoint = format!("http://127.0.0.1:{port}/api/status");
 
@@ -560,6 +582,12 @@ pub async fn run(port: u16) -> Result<()> {
                 }
             }
             announced.retain(|id| s.offers.iter().any(|o| &o.id == id));
+        }
+
+        // gnome-shell restarts (or the extension is toggled) take the icon
+        // down with them. Re-register instead of running on headless.
+        if handle.is_closed() {
+            handle = attach(port).await?;
         }
 
         handle
