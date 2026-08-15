@@ -46,6 +46,8 @@ pub struct App {
     /// Text put up for the other device to collect. Deliberately not saved to
     /// disk — a pasted snippet should not outlive the session.
     pub shared_text: RwLock<String>,
+    /// Browsers currently past the PIN.
+    pub sessions: crate::sessions::Registry,
 }
 
 impl App {
@@ -113,6 +115,10 @@ fn local_only(addr: &SocketAddr) -> Result<(), Response> {
 #[derive(Deserialize)]
 struct AuthReq {
     pin: String,
+    /// What the browser calls itself, so the desktop can say "iPhone
+    /// connected" rather than an IP address.
+    #[serde(default)]
+    device: Option<String>,
 }
 
 async fn do_auth(
@@ -140,6 +146,17 @@ async fn do_auth(
     }
 
     app.throttle.lock().await.record_success(&ip);
+
+    // Connected as of now — the PIN is what counts, not sending anything.
+    let fresh = app
+        .sessions
+        .open(&ip.to_string(), req.device.clone(), auth::now())
+        .await;
+    if fresh {
+        let who = req.device.as_deref().unwrap_or("A device");
+        println!("  + {who} connected from {ip}");
+    }
+
     let token = auth::issue(&app.secret().await, SESSION_SECS);
     // No `Secure`: on the LAN this is plain HTTP and the cookie would be dropped.
     let cookie = format!(
@@ -209,10 +226,22 @@ async fn list_files(dir: &std::path::Path) -> Vec<Received> {
     files.into_iter().map(|(_, f)| f).take(60).collect()
 }
 
-async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
+async fn state(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
     if let Err(r) = guard(&app, &headers).await {
         return r;
     }
+
+    // The page polls this every couple of seconds, which is what keeps the
+    // desktop's "connected" list honest without a websocket.
+    let now = auth::now();
+    app.sessions
+        .touch(&addr.ip().to_string(), device_header(&headers), now)
+        .await;
+    app.sessions.sweep(now).await;
 
     let files = list_files(&app.dir().await).await;
     let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
@@ -509,15 +538,19 @@ fn local_offset_secs() -> i64 {
     })
 }
 
-/// Who is sending. Senders that can say so set `X-Drop-Device`.
-fn sender_name(headers: &HeaderMap, addr: &SocketAddr) -> String {
+/// The name a client claims for itself, if it sets `X-Drop-Device`.
+fn device_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-drop-device")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.chars().take(64).collect())
-        .unwrap_or_else(|| format!("Device at {}", addr.ip()))
+}
+
+/// Who is sending. Senders that can say so set `X-Drop-Device`.
+fn sender_name(headers: &HeaderMap, addr: &SocketAddr) -> String {
+    device_header(headers).unwrap_or_else(|| format!("Device at {}", addr.ip()))
 }
 
 #[derive(Deserialize)]
@@ -834,6 +867,7 @@ async fn status(
         "shared_files": shared,
         "shared_text": shared_text,
         "outbox": app.outbox().await,
+        "connected": app.sessions.live(auth::now()).await,
         "name": cfg.name,
         "pin": cfg.pin,
         "port": cfg.port,
@@ -1172,6 +1206,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         offers: Default::default(),
         cfg: RwLock::new(cfg.clone()),
         shared_text: RwLock::new(String::new()),
+        sessions: Default::default(),
     });
 
     // mDNS: advertise, and keep an eye on who else is out there.

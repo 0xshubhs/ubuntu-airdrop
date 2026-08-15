@@ -19,6 +19,13 @@ pub struct OfferFile {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct Connected {
+    pub device: String,
+    #[serde(default)]
+    pub ip: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PendingOffer {
     pub id: String,
@@ -44,6 +51,9 @@ pub struct Status {
     pub received: u64,
     pub peers: usize,
     pub files_waiting: usize,
+    /// Browsers past the PIN right now.
+    #[serde(default)]
+    pub connected: Vec<Connected>,
     /// What this machine is offering outward.
     #[serde(default)]
     pub shared: usize,
@@ -189,6 +199,19 @@ impl Tray for DropTray {
             }
             .into(),
         );
+
+        // Who is on the page right now. This is the cue that sending from
+        // this end will actually reach something.
+        for c in &s.connected {
+            items.push(
+                StandardItem {
+                    label: format!("● {} connected", c.device),
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+            );
+        }
         items.push(
             StandardItem {
                 label: "Open Drop window".into(),
@@ -686,6 +709,7 @@ pub async fn run(port: u16) -> Result<()> {
     // that arrived before the tray started.
     let mut seen: Option<u64> = None;
     let mut announced: std::collections::HashSet<String> = Default::default();
+    let mut online: std::collections::HashSet<String> = Default::default();
 
     loop {
         let fetched: Option<Status> = match client
@@ -722,6 +746,15 @@ pub async fn run(port: u16) -> Result<()> {
                 }
             }
             announced.retain(|id| s.offers.iter().any(|o| &o.id == id));
+
+            // Say so once when a device gets past the PIN, so it is obvious
+            // that sending from this end will land somewhere.
+            for c in &s.connected {
+                if online.insert(c.ip.clone()) {
+                    notify_connected(&c.device, port);
+                }
+            }
+            online.retain(|ip| s.connected.iter().any(|c| &c.ip == ip));
         }
 
         // gnome-shell restarts (or the extension is toggled) take the icon
@@ -810,6 +843,28 @@ fn notify_offer(offer: &PendingOffer, port: u16) {
 
 /// Shell out to `notify-send` rather than link a notification library:
 /// the blocking D-Bus clients panic when called from inside a tokio runtime.
+/// A device just got past the PIN. Offer the window straight away, since
+/// that is where anything gets sent back to it from.
+fn notify_connected(device: &str, port: u16) {
+    let body = format!("{device} is connected. You can send files or a note to it now.");
+    std::thread::spawn(move || {
+        let out = Command::new("notify-send")
+            .args([
+                "--app-name=Drop",
+                "--icon=phone",
+                "--action=send=Send something",
+                "Drop",
+                &body,
+            ])
+            .output();
+        if let Ok(out) = out {
+            if String::from_utf8_lossy(&out.stdout).trim() == "send" {
+                let _ = crate::panel::open(port);
+            }
+        }
+    });
+}
+
 fn notify(count: u64, dir: &std::path::Path) {
     let where_ = dir
         .file_name()

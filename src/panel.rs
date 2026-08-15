@@ -77,6 +77,14 @@ pub const PANEL: &str = r####"<!doctype html>
   li .meta{color:var(--muted); font-size:.76rem; white-space:nowrap}
   .dot{width:7px; height:7px; border-radius:50%; background:var(--live); flex:none}
   .empty{color:var(--muted); font-size:.82rem; padding:.45rem 0}
+  .note{display:flex; gap:.6rem; align-items:flex-start; padding:.55rem 0;
+        border-bottom:1px solid var(--rule)}
+  .note textarea{flex:1; min-width:0; padding:.5rem; border:1px solid var(--rule);
+        border-radius:7px; background:transparent; color:inherit; font:inherit;
+        font-size:.85rem; resize:vertical}
+  .note textarea:focus{outline:2px solid var(--signal); outline-offset:1px}
+  /* A connected device is the whole point of the section below it. */
+  li.live .name{font-weight:600}
   footer{margin-top:2rem; color:var(--muted); font-size:.75rem}
   .toast{position:fixed; left:50%; bottom:1.2rem; transform:translateX(-50%);
     background:var(--ink); color:var(--paper); padding:.5rem 1rem; border-radius:999px;
@@ -151,14 +159,22 @@ pub const PANEL: &str = r####"<!doctype html>
   <button class="act" id="b-pin">New PIN</button>
 </div>
 
-<h2>Sending</h2>
+<h2>Connected</h2>
+<ul id="connected"></ul>
+
+<h2>Send to them</h2>
+<p class="hint" id="s-target">Nothing is connected yet.</p>
 <div class="set">
   <span class="label">Files<small id="s-count">Nothing on offer</small></span>
   <button class="act" id="b-share">Choose files…</button>
 </div>
 <div class="set">
-  <span class="label">Clipboard<small>Put the current clipboard up for collection</small></span>
+  <span class="label">Clipboard<small>Put what you have copied up for collection</small></span>
   <button class="act" id="b-cliptext">Send clipboard</button>
+</div>
+<div class="note">
+  <textarea id="note" rows="2" placeholder="Or type a note here…"></textarea>
+  <button class="act" id="b-note">Send note</button>
 </div>
 <div class="set">
   <span class="label">Stop<small>Empty the Shared folder and drop the text</small></span>
@@ -304,6 +320,8 @@ async function refresh(){
         + `<span class="meta mono">${esc(p.host)}:${p.port}</span></li>`).join('')
     : '<li class="empty">No other devices advertising.</li>';
 
+  drawConnected(s.connected || [], Math.floor(Date.now() / 1000));
+
   const shared = s.shared_files || [];
   const hasText = !!(s.shared_text && s.shared_text.length);
   const offering = shared.length + (hasText ? 1 : 0);
@@ -324,9 +342,44 @@ async function refresh(){
     : '<li class="empty">Choose files, or drop them in the Shared folder.</li>';
 }
 
+function ago(secs){
+  if (secs < 60) return 'just now';
+  const m = Math.floor(secs / 60);
+  if (m < 60) return m + (m === 1 ? ' min ago' : ' mins ago');
+  const h = Math.floor(m / 60);
+  return h + (h === 1 ? ' hour ago' : ' hours ago');
+}
+
+function drawConnected(list, now){
+  const box = $('#connected');
+  box.innerHTML = list.length
+    ? list.map(c =>
+        `<li class="live"><span class="dot"></span>`
+        + `<span class="name">${esc(c.device)}</span>`
+        + `<span class="meta mono">${esc(c.ip)} · since ${esc(ago(now - c.since))}</span></li>`).join('')
+    : '<li class="empty">Nothing connected. Scan the QR and enter the PIN on the phone.</li>';
+
+  // Name who is going to collect whatever gets shared.
+  const target = $('#s-target');
+  if (!list.length){
+    target.textContent = 'Nothing is connected yet — anything you share here waits until something is.';
+  } else if (list.length === 1){
+    target.textContent = list[0].device + ' is connected and will see anything you put up here.';
+  } else {
+    target.textContent = list.map(c => c.device).join(', ') + ' are connected.';
+  }
+}
+
 $('#b-share').onclick    = () => post('/api/control/share-files-picker');
 $('#b-cliptext').onclick = () => post('/api/control/share-clipboard');
 $('#b-unshare').onclick  = () => post('/api/control/unshare');
+$('#b-note').onclick     = async () => {
+  const text = $('#note').value;
+  if (!text.trim()) return;
+  await post('/api/control/share-text', {text});
+  $('#note').value = '';
+  toast('Note shared');
+};
 
 refresh(); setInterval(refresh, 2000);
 </script>

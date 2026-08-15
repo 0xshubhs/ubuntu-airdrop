@@ -170,9 +170,11 @@ $('#gateform').addEventListener('submit', async e => {
   e.preventDefault();
   const pin = $('#pin').value.trim();
   if (!pin) return;
+  // Say who we are here, so the desktop can show "iPhone connected" the
+  // moment the PIN lands rather than waiting for a transfer.
   const r = await fetch('/api/auth', {
     method:'POST', headers:{'Content-Type':'application/json'},
-    body: JSON.stringify({pin})
+    body: JSON.stringify({pin, device: deviceName()})
   });
   if (r.ok) { $('#pin').value=''; showApp(); refresh(); return; }
   const body = await r.json().catch(() => ({}));
@@ -389,7 +391,9 @@ $('#copy').addEventListener('click', async () => {
 
 async function refresh(){
   let r;
-  try { r = await fetch('/api/state'); } catch { return; }
+  // The same header on every poll is what keeps us listed as connected.
+  try { r = await fetch('/api/state', {headers:{'X-Drop-Device': deviceName()}}); }
+  catch { return; }
   if (r.status === 401) { showGate(); return; }
   if (!r.ok) return;
   const s = await r.json();

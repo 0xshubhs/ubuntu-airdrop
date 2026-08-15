@@ -11,6 +11,7 @@ mod popover;
 mod qr;
 mod send;
 mod server;
+mod sessions;
 mod tray;
 mod tunnel;
 

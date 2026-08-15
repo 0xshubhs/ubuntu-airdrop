@@ -143,9 +143,24 @@ positioning itself, but XWayland does not, and Chromium-family browsers take
 primary display read from `xrandr`. Without such a browser it falls back to handing the
 QR image to a viewer. `drop popover` opens it from a terminal.
 
+## Knowing something is connected
+
+A device counts as connected the moment it gets past the PIN — not when it
+sends anything. The page says who it is when it unlocks, and its ordinary
+polling keeps it listed; go quiet for 75 seconds and it drops off.
+
+The indicator shows `● iPhone connected`, the window lists it under
+**Connected**, and a notification says so once on arrival. That is the cue
+that anything you put up from this end has somewhere to go.
+
 ## Sending, not just receiving
 
 It goes both ways, for files of any kind and for plain text.
+
+Nothing in this direction asks the phone to accept anything. The desktop puts
+things up, the phone sees them and takes them if it wants: text with a **Copy**
+button, files with a download link. The accept prompt exists for the other
+direction, where something arrives unasked.
 
 **Desktop → phone.** A browser cannot be pushed to, so instead the desktop
 *offers* and the phone collects. Anything in `~/Drop/Shared` shows up on the
