@@ -151,6 +151,21 @@ pub const PANEL: &str = r####"<!doctype html>
   <button class="act" id="b-pin">New PIN</button>
 </div>
 
+<h2>Sending</h2>
+<div class="set">
+  <span class="label">Files<small id="s-count">Nothing on offer</small></span>
+  <button class="act" id="b-share">Choose files…</button>
+</div>
+<div class="set">
+  <span class="label">Clipboard<small>Put the current clipboard up for collection</small></span>
+  <button class="act" id="b-cliptext">Send clipboard</button>
+</div>
+<div class="set">
+  <span class="label">Stop<small>Empty the Shared folder and drop the text</small></span>
+  <button class="act" id="b-unshare">Stop offering</button>
+</div>
+<ul id="shared"></ul>
+
 <h2>Received</h2>
 <ul id="files"></ul>
 
@@ -288,7 +303,30 @@ async function refresh(){
     ? s.peers_list.map(p => `<li><span class="dot"></span><span class="name">${esc(p.label)}</span>`
         + `<span class="meta mono">${esc(p.host)}:${p.port}</span></li>`).join('')
     : '<li class="empty">No other devices advertising.</li>';
+
+  const shared = s.shared_files || [];
+  const hasText = !!(s.shared_text && s.shared_text.length);
+  const offering = shared.length + (hasText ? 1 : 0);
+  $('#s-count').textContent = offering
+    ? offering + (offering === 1 ? ' item waiting to be collected' : ' items waiting to be collected')
+    : 'Nothing on offer';
+  $('#b-unshare').disabled = !offering;
+
+  const rows = shared.map(f =>
+    `<li><span class="name">${esc(f.name)}</span>`
+    + `<span class="meta mono">${esc(f.size)}</span></li>`);
+  if (hasText){
+    const one = s.shared_text.split('\n')[0].slice(0, 60);
+    rows.unshift(`<li><span class="name">“${esc(one)}”</span>`
+      + `<span class="meta mono">text</span></li>`);
+  }
+  $('#shared').innerHTML = rows.length ? rows.join('')
+    : '<li class="empty">Choose files, or drop them in the Shared folder.</li>';
 }
+
+$('#b-share').onclick    = () => post('/api/control/share-files-picker');
+$('#b-cliptext').onclick = () => post('/api/control/share-clipboard');
+$('#b-unshare').onclick  = () => post('/api/control/unshare');
 
 refresh(); setInterval(refresh, 2000);
 </script>

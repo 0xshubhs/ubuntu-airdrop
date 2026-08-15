@@ -72,6 +72,19 @@ pub const PAGE: &str = r####"<!doctype html>
       animation:dots 1.2s steps(4,end) infinite}
   }
   @keyframes dots{0%{content:""}25%{content:"."}50%{content:".."}75%{content:"..."}}
+  textarea{
+    width:100%; padding:.7rem; border:1px solid var(--rule); background:transparent;
+    color:inherit; font:inherit; resize:vertical;
+  }
+  textarea:focus{outline:2px solid var(--signal); outline-offset:1px}
+  .row{display:flex; align-items:center; gap:.75rem; margin-top:.6rem}
+  .row button{margin-left:0}
+  #shared-text pre{
+    margin:0 0 .6rem; padding:.7rem; border:1px solid var(--rule);
+    white-space:pre-wrap; word-break:break-word; max-height:12rem; overflow:auto;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:.85rem;
+  }
+  #shared-text button{margin-left:0}
   footer{margin-top:2.5rem; color:var(--muted); font-size:.78rem}
   #gate{text-align:center; padding:3rem 0}
   #gate p{color:var(--muted); font-size:.85rem; margin:.4rem 0 1.6rem}
@@ -108,6 +121,23 @@ pub const PAGE: &str = r####"<!doctype html>
   </div>
   <input id="picker" type="file" multiple hidden>
   <div id="bar"></div>
+
+  <h2>Send text</h2>
+  <form id="textform">
+    <textarea id="text" rows="3" placeholder="Paste anything here"></textarea>
+    <div class="row">
+      <button type="submit">Send text</button>
+      <span class="meta mono" id="textnote"></span>
+    </div>
+  </form>
+
+  <h2>Shared with you</h2>
+  <div id="shared-text" hidden>
+    <pre id="shared-text-body"></pre>
+    <button type="button" id="copy">Copy</button>
+    <span class="meta mono" id="copynote"></span>
+  </div>
+  <ul id="shared"></ul>
 
   <h2>Received</h2>
   <ul id="files"></ul>
@@ -292,6 +322,71 @@ function sendBytes(files, id, total){
   xhr.send(form);
 }
 
+// Text goes the same way a file does: announced, then accepted, then saved.
+$('#textform').addEventListener('submit', async e => {
+  e.preventDefault();
+  const body = $('#text').value;
+  if (!body.trim()) return;
+  const note = $('#textnote');
+  note.textContent = 'Sending…';
+
+  let r;
+  try {
+    r = await fetch('/api/text', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({device: deviceName(), text: body}),
+    });
+  } catch { note.textContent = 'Could not reach the other device.'; return; }
+
+  if (r.status === 401) { showGate('Session expired. Enter the PIN again.'); return; }
+  if (r.status === 413) { note.textContent = 'Too long — send it as a file.'; return; }
+  if (!r.ok) { note.textContent = 'Refused (' + r.status + ').'; return; }
+
+  const out = await r.json().catch(() => ({}));
+  if (out.status === 'saved'){
+    $('#text').value = '';
+    note.textContent = 'Sent.';
+    setTimeout(() => note.textContent = '', 4000);
+    return;
+  }
+
+  // Waiting on the accept prompt over there.
+  held('wait', 'Waiting to be accepted', human(new Blob([body]).size) + ' of text');
+  const verdict = await awaitVerdict(out.offer);
+  if (verdict === 'accepted' || verdict === 'complete'){
+    $('#text').value = '';
+    note.textContent = '';
+    held('yes', 'Sent', 'The text is on the other device.');
+    hideHeld(4000);
+  } else if (verdict === 'declined'){
+    note.textContent = '';
+    held('no', 'Declined', 'The other device turned it down.');
+    hideHeld(6000);
+  } else {
+    note.textContent = '';
+    held('no', 'No response', 'It expired without an answer.');
+    hideHeld(6000);
+  }
+});
+
+$('#copy').addEventListener('click', async () => {
+  const body = $('#shared-text-body').textContent;
+  const note = $('#copynote');
+  try {
+    await navigator.clipboard.writeText(body);
+    note.textContent = 'Copied.';
+  } catch {
+    // iOS refuses the clipboard API outside a secure context, so fall back
+    // to selecting it and letting the user copy by hand.
+    const r = document.createRange();
+    r.selectNodeContents($('#shared-text-body'));
+    const sel = getSelection(); sel.removeAllRanges(); sel.addRange(r);
+    note.textContent = 'Selected — press Copy.';
+  }
+  setTimeout(() => note.textContent = '', 4000);
+});
+
 async function refresh(){
   let r;
   try { r = await fetch('/api/state'); } catch { return; }
@@ -299,6 +394,22 @@ async function refresh(){
   if (!r.ok) return;
   const s = await r.json();
   showApp();
+
+  const st = $('#shared-text');
+  if (s.text){
+    // Do not stomp on the text while it is selected for copying.
+    if ($('#shared-text-body').textContent !== s.text)
+      $('#shared-text-body').textContent = s.text;
+    st.hidden = false;
+  } else {
+    st.hidden = true;
+  }
+
+  $('#shared').innerHTML = (s.shared && s.shared.length)
+    ? s.shared.map(f =>
+        `<li><a href="/shared/${encodeURIComponent(f.name)}" download>${esc(f.name)}</a>`
+        + `<span class="meta mono">${esc(f.size)}</span></li>`).join('')
+    : (s.text ? '' : '<li class="empty">Nothing shared from the other device.</li>');
 
   $('#files').innerHTML = s.files.length
     ? s.files.map(f =>

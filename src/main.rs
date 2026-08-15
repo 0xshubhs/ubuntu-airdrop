@@ -47,11 +47,14 @@ enum Cmd {
         #[arg(long, default_value = "2")]
         wait: f32,
     },
-    /// Push files to a peer
+    /// Push files, or a snippet with --text, to a peer
     Send {
         /// Peer name, IP, or host:port
         to: String,
         files: Vec<String>,
+        /// Send this text instead of files. "-" reads stdin.
+        #[arg(long, conflicts_with = "files")]
+        text: Option<String>,
         #[arg(long)]
         pin: Option<String>,
         #[arg(long, default_value = "2")]
@@ -120,11 +123,12 @@ async fn main() -> Result<()> {
         Cmd::Send {
             to,
             files,
+            text,
             pin,
             wait,
         } => {
-            if files.is_empty() {
-                anyhow::bail!("give me at least one file");
+            if files.is_empty() && text.is_none() {
+                anyhow::bail!("give me at least one file, or --text");
             }
             // Without --pin, assume the peer shares our PIN (common when both
             // ends are yours); otherwise the receiver rejects it and says so.
@@ -132,7 +136,18 @@ async fn main() -> Result<()> {
                 Some(p) => p,
                 None => Config::load()?.pin,
             };
-            send::send(&to, &send::expand(&files), &pin, secs(wait)).await
+
+            match text {
+                Some(t) => {
+                    let body = if t == "-" {
+                        std::io::read_to_string(std::io::stdin())?
+                    } else {
+                        t
+                    };
+                    send::send_text(&to, &body, &pin, secs(wait)).await
+                }
+                None => send::send(&to, &send::expand(&files), &pin, secs(wait)).await,
+            }
         }
 
         Cmd::Panel => {

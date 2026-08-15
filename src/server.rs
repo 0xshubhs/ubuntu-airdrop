@@ -43,6 +43,9 @@ pub struct App {
     pub counter: AtomicU64,
     pub tunnel_tx: mpsc::Sender<bool>,
     pub offers: crate::offers::Registry,
+    /// Text put up for the other device to collect. Deliberately not saved to
+    /// disk — a pasted snippet should not outlive the session.
+    pub shared_text: RwLock<String>,
 }
 
 impl App {
@@ -54,6 +57,13 @@ impl App {
     }
     async fn dir(&self) -> PathBuf {
         self.cfg.read().await.dir.clone()
+    }
+
+    /// Files this machine is offering outward. A real folder rather than a
+    /// hidden store, so dragging something into it in the file manager is
+    /// enough to put it on the phone.
+    async fn outbox(&self) -> PathBuf {
+        self.dir().await.join("Shared")
     }
 }
 
@@ -206,12 +216,265 @@ async fn state(State(app): State<Arc<App>>, headers: HeaderMap) -> Response {
 
     let files = list_files(&app.dir().await).await;
     let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
+    let shared = list_files(&app.outbox().await).await;
+    let text = app.shared_text.read().await.clone();
     Json(json!({
         "device": app.cfg.read().await.name,
         "files": files,
         "peers": peers,
+        "shared": shared,
+        "text": text,
     }))
     .into_response()
+}
+
+/// A snippet is meant to be a paste, not a file transfer by another name.
+const MAX_TEXT: usize = 64 * 1024;
+
+#[derive(Deserialize)]
+struct TextIn {
+    text: String,
+    #[serde(default)]
+    device: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ShareIn {
+    paths: Vec<String>,
+}
+
+/// Collect a file this machine is offering. Same containment check as
+/// `download`, against the outbox instead of the Drop folder.
+async fn collect(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    AxPath(fname): AxPath<String>,
+) -> Response {
+    if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+    serve_from(&app.outbox().await, &fname).await
+}
+
+/// Take a pasted snippet from the other device. It goes through the same
+/// accept prompt as a file, so nothing arrives unannounced.
+async fn receive_text(
+    State(app): State<Arc<App>>,
+    headers: HeaderMap,
+    Json(req): Json<TextIn>,
+) -> Response {
+    if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+
+    let body = req.text.trim_end_matches('\n').to_string();
+    if body.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "empty"}))).into_response();
+    }
+    if body.len() > MAX_TEXT {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(json!({"error": "too long"})),
+        )
+            .into_response();
+    }
+
+    let device = req.device.unwrap_or_else(|| "A device".into());
+    let dir = app.dir().await;
+    let stage = dir.join(".staging").join(crate::config::random_hex(8));
+    if tokio::fs::create_dir_all(&stage).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "cannot stage").into_response();
+    }
+
+    let name = format!("text-{}.txt", crate::auth::now());
+    if tokio::fs::write(stage.join(&name), &body).await.is_err() {
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        return (StatusCode::INTERNAL_SERVER_ERROR, "cannot stage").into_response();
+    }
+
+    let file = crate::offers::OfferFile {
+        name: name.clone(),
+        size: body.len() as u64,
+    };
+
+    // With approval turned off it still has to land, just without the prompt.
+    if !app.cfg.read().await.require_approval {
+        let dest = {
+            let cfg = app.cfg.read().await;
+            if cfg.auto_move {
+                cfg.move_target.clone()
+            } else {
+                cfg.dir.clone()
+            }
+        };
+        let landed = relocate(&stage.join(&name), &dest).await.is_ok();
+        let _ = tokio::fs::remove_dir_all(&stage).await;
+        if !landed {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "cannot save").into_response();
+        }
+        to_clipboard(&body);
+        note_received(&app, &name, body.len() as u64).await;
+        println!("  <- text ({} bytes) from {device}", body.len());
+        return Json(json!({"status": "saved", "name": name})).into_response();
+    }
+
+    let offer = app
+        .offers
+        .create_text(device, file, stage, body.clone())
+        .await;
+    println!("  ? {} offers a text snippet", offer.device);
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({"status": "pending_approval", "offer": offer.id})),
+    )
+        .into_response()
+}
+
+/// Put a snippet up for the other device to collect.
+async fn share_text(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<TextIn>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let body = if req.text.len() > MAX_TEXT {
+        req.text[..MAX_TEXT].to_string()
+    } else {
+        req.text
+    };
+    *app.shared_text.write().await = body.clone();
+    Json(json!({"ok": true, "len": body.len()})).into_response()
+}
+
+/// Copy files into the outbox so the other device can collect them.
+async fn share_files(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<ShareIn>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    copy_into_outbox(&app, req.paths).await
+}
+
+async fn copy_into_outbox(app: &Arc<App>, paths: Vec<String>) -> Response {
+    let outbox = app.outbox().await;
+    if tokio::fs::create_dir_all(&outbox).await.is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "cannot create outbox").into_response();
+    }
+
+    let mut added = Vec::new();
+    for raw in paths {
+        let from = std::path::PathBuf::from(&raw);
+        let Some(base) = from.file_name() else {
+            continue;
+        };
+        if !from.is_file() {
+            continue;
+        }
+        // Copy rather than move: sharing something should not take it out of
+        // the folder the user keeps it in.
+        let to = crate::net::safe_name(&base.to_string_lossy(), &outbox);
+        if tokio::fs::copy(&from, &to).await.is_ok() {
+            added.push(to.file_name().unwrap_or_default().to_string_lossy().to_string());
+        }
+    }
+    println!("  -> sharing {} file(s)", added.len());
+    Json(json!({"shared": added})).into_response()
+}
+
+/// The same two actions as the tray's, for the Drop window — which is a web
+/// page and cannot open a file dialog or read the clipboard itself.
+async fn share_files_picker(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+
+    // zenity blocks until the user is done, so it cannot run on the runtime.
+    let Ok(Some(paths)) = tokio::task::spawn_blocking(crate::tray::pick_files).await else {
+        return Json(json!({"shared": Vec::<String>::new()})).into_response();
+    };
+    copy_into_outbox(&app, paths).await
+}
+
+async fn share_clipboard(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+
+    let Ok(Some(text)) = tokio::task::spawn_blocking(crate::tray::clipboard).await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "no clipboard here"})),
+        )
+            .into_response();
+    };
+    if text.trim().is_empty() {
+        return Json(json!({"ok": false, "len": 0})).into_response();
+    }
+    let text = if text.len() > MAX_TEXT {
+        text[..MAX_TEXT].to_string()
+    } else {
+        text
+    };
+    let len = text.len();
+    *app.shared_text.write().await = text;
+    Json(json!({"ok": true, "len": len})).into_response()
+}
+
+/// Stop offering everything: empty the outbox and drop the snippet.
+async fn unshare(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let outbox = app.outbox().await;
+    let mut removed = 0;
+    if let Ok(mut rd) = tokio::fs::read_dir(&outbox).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.metadata().await.map(|m| m.is_file()).unwrap_or(false)
+                && tokio::fs::remove_file(entry.path()).await.is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    app.shared_text.write().await.clear();
+    Json(json!({"removed": removed})).into_response()
+}
+
+/// Put a snippet on the desktop clipboard. Best effort: wl-copy is only a
+/// recommended dependency, and a headless session has no clipboard at all.
+fn to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let Ok(mut child) = Command::new("wl-copy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(text.as_bytes());
+    }
+    // wl-copy forks a server to own the selection; do not block on it.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// Seconds-since-epoch to local `HH:MM`, without pulling in a date library.
@@ -515,10 +778,14 @@ async fn download(
         return r;
     }
 
-    let dir = app.dir().await;
+    serve_from(&app.dir().await, &fname).await
+}
+
+/// Stream one file out of `dir`, and nothing outside it.
+async fn serve_from(dir: &std::path::Path, fname: &str) -> Response {
     // Take only the final component, then confirm the result really is inside
-    // the Drop folder before opening it.
-    let Some(base) = std::path::Path::new(&fname).file_name() else {
+    // the folder before opening it.
+    let Some(base) = std::path::Path::new(fname).file_name() else {
         return (StatusCode::NOT_FOUND, "no such file").into_response();
     };
     let path = dir.join(base);
@@ -559,8 +826,14 @@ async fn status(
     let recent: Vec<_> = app.recent.read().await.iter().cloned().collect();
     let files = list_files(&cfg.dir).await;
     let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
+    let shared = list_files(&app.outbox().await).await;
+    let shared_text = app.shared_text.read().await.clone();
 
     Json(json!({
+        "shared": shared.len(),
+        "shared_files": shared,
+        "shared_text": shared_text,
+        "outbox": app.outbox().await,
         "name": cfg.name,
         "pin": cfg.pin,
         "port": cfg.port,
@@ -705,6 +978,13 @@ async fn decide_offer(
         }
     }
     let _ = tokio::fs::remove_dir_all(&stage).await;
+
+    // A snippet is saved like a file, but the point of sending one is usually
+    // to paste it, so put it on the clipboard too.
+    if let Some(text) = &offer.text {
+        to_clipboard(text);
+    }
+
     app.offers
         .set_status(&id, crate::offers::Status::Complete)
         .await;
@@ -852,6 +1132,13 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/offer/{id}", get(offer_status))
         .route("/api/control/offer/{id}", post(decide_offer))
         .route("/files/{fname}", get(download))
+        .route("/shared/{fname}", get(collect))
+        .route("/api/text", post(receive_text))
+        .route("/api/control/share-text", post(share_text))
+        .route("/api/control/share-files", post(share_files))
+        .route("/api/control/share-files-picker", post(share_files_picker))
+        .route("/api/control/share-clipboard", post(share_clipboard))
+        .route("/api/control/unshare", post(unshare))
         .route("/api/status", get(status))
         .route("/panel", get(panel))
         .route("/popover", get(popover))
@@ -884,6 +1171,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         tunnel_tx,
         offers: Default::default(),
         cfg: RwLock::new(cfg.clone()),
+        shared_text: RwLock::new(String::new()),
     });
 
     // mDNS: advertise, and keep an eye on who else is out there.

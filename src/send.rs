@@ -171,3 +171,68 @@ pub async fn send(target: &str, files: &[PathBuf], pin: &str, wait: Duration) ->
 pub fn expand(raw: &[String]) -> Vec<PathBuf> {
     raw.iter().map(|s| Path::new(s).to_path_buf()).collect()
 }
+
+/// Push a snippet instead of a file. The receiver saves it and puts it on
+/// their clipboard, after the same accept prompt a file gets.
+pub async fn send_text(target: &str, text: &str, pin: &str, wait: Duration) -> Result<()> {
+    if text.trim().is_empty() {
+        bail!("nothing to send");
+    }
+
+    let hostport = resolve(target, wait).await?;
+    let me = crate::config::hostname();
+    let client = reqwest::Client::new();
+
+    let res = client
+        .post(format!("http://{hostport}/api/text"))
+        .header("X-Drop-Pin", pin)
+        .header("X-Drop-Device", &me)
+        .json(&serde_json::json!({"device": me, "text": text}))
+        .send()
+        .await
+        .context("could not reach the receiver")?;
+
+    match res.status() {
+        reqwest::StatusCode::UNAUTHORIZED => bail!("rejected: wrong PIN"),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE => bail!("too long — send it as a file"),
+        s if s == reqwest::StatusCode::OK => {
+            println!("   sent");
+            return Ok(());
+        }
+        s if s != reqwest::StatusCode::ACCEPTED => bail!("server said {s}"),
+        _ => {}
+    }
+
+    let body: serde_json::Value = res.json().await.unwrap_or_default();
+    let Some(id) = body.get("offer").and_then(|v| v.as_str()) else {
+        bail!("receiver returned no offer id");
+    };
+
+    println!("   waiting for {target} to accept…");
+    let deadline = std::time::Instant::now() + APPROVAL_WAIT;
+    loop {
+        if std::time::Instant::now() > deadline {
+            bail!("timed out waiting for a decision");
+        }
+        tokio::time::sleep(Duration::from_millis(700)).await;
+
+        let status: serde_json::Value = client
+            .get(format!("http://{hostport}/api/offer/{id}"))
+            .header("X-Drop-Pin", pin)
+            .send()
+            .await?
+            .json()
+            .await
+            .unwrap_or_default();
+
+        match status.get("status").and_then(|v| v.as_str()) {
+            Some("accepted") | Some("complete") => {
+                println!("   sent");
+                return Ok(());
+            }
+            Some("declined") => bail!("declined by the receiver"),
+            Some("expired") => bail!("the offer expired without an answer"),
+            _ => continue,
+        }
+    }
+}

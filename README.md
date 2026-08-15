@@ -143,6 +143,38 @@ positioning itself, but XWayland does not, and Chromium-family browsers take
 primary display read from `xrandr`. Without such a browser it falls back to handing the
 QR image to a viewer. `drop popover` opens it from a terminal.
 
+## Sending, not just receiving
+
+It goes both ways, for files of any kind and for plain text.
+
+**Desktop → phone.** A browser cannot be pushed to, so instead the desktop
+*offers* and the phone collects. Anything in `~/Drop/Shared` shows up on the
+phone's page under **Shared with you**, ready to download. Three ways to put
+something there:
+
+- the indicator → **Send files to the other device…** (a normal file picker)
+- the Drop window → **Sending** → **Choose files…**
+- drag files into `~/Drop/Shared` in the file manager — nothing else needed
+
+**Send clipboard** puts whatever you have copied up as text instead. The phone
+sees it in a box with a **Copy** button. Both are cleared by **Stop offering**.
+
+**Phone → desktop.** Files work as they always have. For text, the page has a
+**Send text** box: type or paste, send, and it goes through the same accept
+prompt a file does. Once accepted it is saved as `text-<time>.txt` in the Drop
+folder *and* placed on the desktop clipboard, so it is ready to paste.
+
+Snippets are capped at 64 KB — past that it is a file, so send it as one.
+Shared text lives in memory only and does not survive a restart.
+
+**Desktop → desktop** uses the same accept prompt:
+
+```bash
+drop send thinkpad ~/photo.jpg          # files
+drop send thinkpad --text "some notes"  # a snippet
+wl-paste | drop send thinkpad --text -  # the clipboard
+```
+
 ## CLI
 
 ```bash
@@ -152,6 +184,7 @@ drop qr                         # QR + PIN for pairing a phone
 drop open                       # open the Drop folder
 drop peers                      # other devices advertising
 drop send thinkpad ~/photo.jpg  # push to a peer by name, IP, or host:port
+drop send thinkpad --text hello # push a snippet instead
 drop pin                        # new PIN, invalidates live sessions
 drop serve                      # run the daemon in the foreground
 drop tray                       # run the indicator

@@ -47,6 +47,10 @@ pub struct Offer {
     pub created: u64,
     /// Set when the bytes are already on disk waiting for a verdict.
     pub staged: Option<PathBuf>,
+    /// A pasted snippet rather than a file. Held here so that accepting it
+    /// can put it on the clipboard as well as saving it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
 }
 
 impl Offer {
@@ -67,6 +71,29 @@ impl Registry {
         files: Vec<OfferFile>,
         staged: Option<PathBuf>,
     ) -> Offer {
+        self.create_inner(device, files, staged, None).await
+    }
+
+    /// A text snippet, offered the same way a file is so that it goes through
+    /// the same accept prompt.
+    pub async fn create_text(
+        &self,
+        device: String,
+        file: OfferFile,
+        staged: PathBuf,
+        text: String,
+    ) -> Offer {
+        self.create_inner(device, vec![file], Some(staged), Some(text))
+            .await
+    }
+
+    async fn create_inner(
+        &self,
+        device: String,
+        files: Vec<OfferFile>,
+        staged: Option<PathBuf>,
+        text: Option<String>,
+    ) -> Offer {
         let total = files.iter().map(|f| f.size).sum();
         let offer = Offer {
             id: crate::config::random_hex(8),
@@ -76,6 +103,7 @@ impl Registry {
             status: Status::Pending,
             created: crate::auth::now(),
             staged,
+            text,
         };
         self.map.write().await.insert(offer.id.clone(), offer.clone());
         offer

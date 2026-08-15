@@ -44,6 +44,13 @@ pub struct Status {
     pub received: u64,
     pub peers: usize,
     pub files_waiting: usize,
+    /// What this machine is offering outward.
+    #[serde(default)]
+    pub shared: usize,
+    #[serde(default)]
+    pub shared_text: String,
+    #[serde(default)]
+    pub outbox: PathBuf,
 }
 
 #[derive(Debug)]
@@ -293,12 +300,110 @@ impl Tray for DropTray {
             );
         }
 
+        // ---- sending, the other direction ----
+        items.push(MenuItem::Separator);
+
+        items.push(
+            StandardItem {
+                label: "Send files to the other device…".into(),
+                activate: Box::new(move |this: &mut Self| {
+                    let url = this.url("/api/control/share-files");
+                    // zenity blocks until the user picks, so it cannot run on
+                    // the runtime driving the tray. Hand the request back.
+                    let rt = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let Some(paths) = pick_files() else {
+                            return;
+                        };
+                        if paths.is_empty() {
+                            return;
+                        }
+                        rt.spawn(async move {
+                            let _ = reqwest::Client::new()
+                                .post(url)
+                                .json(&serde_json::json!({"paths": paths}))
+                                .send()
+                                .await;
+                        });
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items.push(
+            StandardItem {
+                label: "Send what is on the clipboard".into(),
+                activate: Box::new(move |this: &mut Self| {
+                    let url = this.url("/api/control/share-text");
+                    let rt = tokio::runtime::Handle::current();
+                    std::thread::spawn(move || {
+                        let Some(text) = clipboard() else {
+                            return;
+                        };
+                        if text.trim().is_empty() {
+                            return;
+                        }
+                        rt.spawn(async move {
+                            let _ = reqwest::Client::new()
+                                .post(url)
+                                .json(&serde_json::json!({"text": text}))
+                                .send()
+                                .await;
+                        });
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        let offering = s.shared + usize::from(!s.shared_text.is_empty());
+        items.push(
+            StandardItem {
+                label: match offering {
+                    0 => "Nothing on offer".into(),
+                    1 => "Stop offering (1 item)".to_string(),
+                    n => format!("Stop offering ({n} items)"),
+                },
+                enabled: offering > 0,
+                activate: Box::new(move |this: &mut Self| {
+                    let url = this.url("/api/control/unshare");
+                    tokio::spawn(async move {
+                        let _ = reqwest::Client::new().post(url).send().await;
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        items.push(MenuItem::Separator);
+
         let dir = s.dir.clone();
         items.push(
             StandardItem {
                 label: "Open Drop folder".into(),
                 activate: Box::new(move |_: &mut Self| {
                     let _ = Command::new("xdg-open").arg(&dir).spawn();
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        let outbox = if s.outbox.as_os_str().is_empty() {
+            s.dir.join("Shared")
+        } else {
+            s.outbox.clone()
+        };
+        items.push(
+            StandardItem {
+                label: "Open Shared folder".into(),
+                activate: Box::new(move |_: &mut Self| {
+                    let _ = std::fs::create_dir_all(&outbox);
+                    let _ = Command::new("xdg-open").arg(&outbox).spawn();
                 }),
                 ..Default::default()
             }
@@ -527,6 +632,41 @@ async fn attach(port: u16) -> Result<ksni::Handle<DropTray>> {
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(Duration::from_secs(5));
     }
+}
+
+/// Ask for files with the desktop's own picker. Returns None if it is not
+/// installed or the user cancelled.
+///
+/// Blocks until the dialog closes, so callers must keep it off the runtime.
+pub fn pick_files() -> Option<Vec<String>> {
+    let out = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--multiple",
+            "--separator=\n",
+            "--title=Send with Drop",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+    )
+}
+
+/// Whatever is on the desktop clipboard right now.
+pub fn clipboard() -> Option<String> {
+    let out = Command::new("wl-paste").arg("--no-newline").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 pub async fn run(port: u16) -> Result<()> {
