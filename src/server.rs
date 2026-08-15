@@ -148,13 +148,20 @@ async fn do_auth(
     app.throttle.lock().await.record_success(&ip);
 
     // Connected as of now — the PIN is what counts, not sending anything.
-    let fresh = app
-        .sessions
-        .open(&ip.to_string(), req.device.clone(), auth::now())
-        .await;
-    if fresh {
-        let who = req.device.as_deref().unwrap_or("A device");
-        println!("  + {who} connected from {ip}");
+    //
+    // Loopback is this machine talking to itself: the Drop window, the
+    // popover, a curl from a terminal here. None of those are a device that
+    // arrived, and listing them would claim a phone is on the page when none
+    // is. Only something that came over the network counts.
+    if !crate::net::is_loopback(&ip) {
+        let fresh = app
+            .sessions
+            .open(&ip.to_string(), req.device.clone(), auth::now())
+            .await;
+        if fresh {
+            let who = req.device.as_deref().unwrap_or("A device");
+            println!("  + {who} connected from {ip}");
+        }
     }
 
     let token = auth::issue(&app.secret().await, SESSION_SECS);
@@ -236,11 +243,14 @@ async fn state(
     }
 
     // The page polls this every couple of seconds, which is what keeps the
-    // desktop's "connected" list honest without a websocket.
+    // desktop's "connected" list honest without a websocket. Loopback is
+    // skipped here for the same reason it is skipped at sign-in.
     let now = auth::now();
-    app.sessions
-        .touch(&addr.ip().to_string(), device_header(&headers), now)
-        .await;
+    if !crate::net::is_loopback(&addr.ip()) {
+        app.sessions
+            .touch(&addr.ip().to_string(), device_header(&headers), now)
+            .await;
+    }
     app.sessions.sweep(now).await;
 
     let files = list_files(&app.dir().await).await;
