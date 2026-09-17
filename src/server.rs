@@ -1204,7 +1204,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
 
     let peers: Peers = Default::default();
     let tunnel_url = Arc::new(RwLock::new(None));
-    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<bool>(4);
+    let (tunnel_tx, tunnel_rx) = mpsc::channel::<bool>(4);
 
     let app = Arc::new(App {
         peers: peers.clone(),
@@ -1231,32 +1231,12 @@ pub async fn serve(cfg: Config) -> Result<()> {
     }
 
     // Tunnel supervisor: owns the cloudflared child, toggled over a channel.
-    {
-        let url_slot = tunnel_url.clone();
-        let port = cfg.port;
-        let start_enabled = cfg.tunnel;
-        tokio::spawn(async move {
-            let mut child: Option<tokio::process::Child> = None;
-            let mut enabled = start_enabled;
-            loop {
-                if enabled && child.is_none() {
-                    match crate::tunnel::spawn(port, url_slot.clone()).await {
-                        Ok(c) => child = Some(c),
-                        Err(e) => eprintln!("  tunnel: {e}"),
-                    }
-                } else if !enabled {
-                    if let Some(mut c) = child.take() {
-                        let _ = c.kill().await;
-                    }
-                    *url_slot.write().await = None;
-                }
-                match tunnel_rx.recv().await {
-                    Some(next) => enabled = next,
-                    None => break,
-                }
-            }
-        });
-    }
+    tokio::spawn(crate::tunnel::supervise(
+        cfg.port,
+        tunnel_url.clone(),
+        cfg.tunnel,
+        tunnel_rx,
+    ));
 
     // Reap offers nobody answered, and the bytes they were holding.
     {
