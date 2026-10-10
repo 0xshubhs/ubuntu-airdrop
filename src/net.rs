@@ -116,3 +116,39 @@ mod tests {
         assert_eq!(safe_name("", &dir).file_name().unwrap(), "untitled");
     }
 }
+
+/// Expand a leading `~` the way a shell would, so a path typed into the
+/// window behaves like one typed into a terminal.
+pub fn expand_home(raw: &str) -> std::path::PathBuf {
+    let raw = raw.trim();
+    let Some(rest) = raw.strip_prefix('~') else {
+        return std::path::PathBuf::from(raw);
+    };
+    let home = dirs::home_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    match rest.strip_prefix('/') {
+        Some(tail) => home.join(tail),
+        // `~` alone, or `~someone`, which is not ours to guess at.
+        None if rest.is_empty() => home,
+        None => std::path::PathBuf::from(raw),
+    }
+}
+
+#[cfg(test)]
+mod home_tests {
+    use super::expand_home;
+
+    #[test]
+    fn expands_a_leading_tilde() {
+        let home = dirs::home_dir().unwrap();
+        assert_eq!(expand_home("~/Drops"), home.join("Drops"));
+        assert_eq!(expand_home("~"), home);
+        assert_eq!(expand_home("  ~/Drops  "), home.join("Drops"));
+    }
+
+    #[test]
+    fn leaves_everything_else_alone() {
+        assert_eq!(expand_home("/srv/drop"), std::path::PathBuf::from("/srv/drop"));
+        assert_eq!(expand_home("relative/path"), std::path::PathBuf::from("relative/path"));
+        assert_eq!(expand_home("~other/drop"), std::path::PathBuf::from("~other/drop"));
+    }
+}

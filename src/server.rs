@@ -1242,6 +1242,163 @@ async fn set_approval(
 }
 
 #[derive(Deserialize)]
+struct SendToReq {
+    host: String,
+    port: u16,
+    #[serde(default)]
+    label: String,
+}
+
+/// Push files to another Drop machine, which is what clicking a device on
+/// the radar does. The same path `drop send` takes, picker and all.
+async fn send_to_peer(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<SendToReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let Some(paths) = tokio::task::spawn_blocking(crate::tray::pick_files)
+        .await
+        .ok()
+        .flatten()
+        .filter(|p: &Vec<String>| !p.is_empty())
+    else {
+        return Json(json!({"cancelled": true})).into_response();
+    };
+
+    // The other end is almost always this person's own machine, so its PIN
+    // is ours. If it is not, the receiver says so and that is the error.
+    let pin = app.pin().await;
+    let target = format!("{}:{}", req.host, req.port);
+    let files = crate::send::expand(&paths);
+    let who = if req.label.is_empty() {
+        target.clone()
+    } else {
+        req.label.clone()
+    };
+    match crate::send::send(&target, &files, &pin, Duration::from_secs(3)).await {
+        Ok(()) => {
+            println!("  -> sent {} file(s) to {who}", files.len());
+            Json(json!({"sent": files.len(), "to": who})).into_response()
+        }
+        Err(e) => {
+            println!("  -> could not send to {who}: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("{who} did not take it: {e}")})),
+            )
+                .into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct NameReq {
+    name: String,
+}
+
+/// "They see you as": the name in the advertisement and on the phone's page.
+async fn set_name(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<NameReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let name = req.name.trim();
+    if name.is_empty() || name.chars().count() > 32 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a name, up to 32 characters"})),
+        )
+            .into_response();
+    }
+
+    {
+        let mut cfg = app.cfg.write().await;
+        cfg.name = name.to_string();
+        let _ = cfg.save();
+    }
+    // Drop the advertisement rather than renaming it: the reconciler puts a
+    // fresh one up within the second, under the new name.
+    if let (Some(mdns), Some(info)) = (app.mdns.as_ref(), app.advert.write().await.take()) {
+        let _ = discovery::unadvertise(mdns, &info);
+    }
+    println!("  known as {name}");
+    Json(json!({"name": name})).into_response()
+}
+
+#[derive(Deserialize)]
+struct DirReq {
+    /// Where files should land. `~` is expanded, and the folder is created.
+    path: String,
+}
+
+/// "Save files to".
+async fn set_dir(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<DirReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let raw = req.path.trim();
+    if raw.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "no folder"}))).into_response();
+    }
+    let path = crate::net::expand_home(raw);
+    if let Err(e) = tokio::fs::create_dir_all(&path).await {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("cannot use {}: {e}", path.display())})),
+        )
+            .into_response();
+    }
+
+    {
+        let mut cfg = app.cfg.write().await;
+        cfg.dir = path.clone();
+        let _ = cfg.save();
+    }
+    println!("  saving to {}", path.display());
+    Json(json!({"dir": path})).into_response()
+}
+
+/// The folder chooser, run for the panel the way the file picker is.
+async fn pick_dir(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let Some(chosen) = tokio::task::spawn_blocking(crate::tray::pick_folder)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return Json(json!({"cancelled": true})).into_response();
+    };
+
+    let path = crate::net::expand_home(&chosen);
+    if tokio::fs::create_dir_all(&path).await.is_err() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "cannot use that folder"})))
+            .into_response();
+    }
+    {
+        let mut cfg = app.cfg.write().await;
+        cfg.dir = path.clone();
+        let _ = cfg.save();
+    }
+    println!("  saving to {}", path.display());
+    Json(json!({"dir": path})).into_response()
+}
+
+#[derive(Deserialize)]
 struct LimitReq {
     /// Percent of the free space one transfer may use. 0 lifts the cap.
     pct: u8,
@@ -1480,6 +1637,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/control/tunnel", post(set_tunnel))
         .route("/api/control/receiving", post(set_receiving))
         .route("/api/control/limit", post(set_limit))
+        .route("/api/control/name", post(set_name))
+        .route("/api/control/dir", post(set_dir))
+        .route("/api/control/dir-picker", post(pick_dir))
+        .route("/api/control/send-to", post(send_to_peer))
         .route("/api/control/visible-for", post(set_visible_for))
         .route("/api/control/move-all", post(move_all))
         .route("/api/control/pin", post(new_pin))
@@ -1576,6 +1737,18 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg.tunnel,
         tunnel_rx,
     ));
+
+    // How far away each device is, as near as Drop can tell. Every few
+    // seconds, because a laptop that has been shut moves to the rim.
+    {
+        let peers = peers.clone();
+        tokio::spawn(async move {
+            loop {
+                discovery::measure(&peers).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+    }
 
     // Reap offers nobody answered, and the bytes they were holding.
     {

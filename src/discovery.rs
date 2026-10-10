@@ -13,6 +13,14 @@ pub struct Peer {
     pub label: String,
     pub host: String,
     pub port: u16,
+    /// Round trip to its port, in milliseconds, when anyone has measured it.
+    /// Drop has no radio signal to report, so this is what the radar places a
+    /// device by: it is the closest honest thing to "how far away is it".
+    #[serde(default)]
+    pub ms: Option<u32>,
+    /// When mDNS last resolved it, so a dot can fade rather than vanish.
+    #[serde(default)]
+    pub seen: u64,
 }
 
 pub type Peers = Arc<RwLock<HashMap<String, Peer>>>;
@@ -79,12 +87,20 @@ pub async fn browse(mdns: ServiceDaemon, exclude: String, peers: Peers) -> Resul
                 let Some(addr) = info.get_addresses().iter().find(|a| a.is_ipv4()) else {
                     continue;
                 };
-                peers.write().await.insert(
-                    info.get_fullname().to_string(),
+                let key = info.get_fullname().to_string();
+                let mut live = peers.write().await;
+                // Keep the measured round trip across a re-resolve; mDNS
+                // repeats itself often and the dot should not jump out to the
+                // rim every time it does.
+                let ms = live.get(&key).and_then(|p| p.ms);
+                live.insert(
+                    key,
                     Peer {
                         label,
                         host: addr.to_string(),
                         port: info.get_port(),
+                        ms,
+                        seen: crate::auth::now(),
                     },
                 );
             }
@@ -95,6 +111,36 @@ pub async fn browse(mdns: ServiceDaemon, exclude: String, peers: Peers) -> Resul
         }
     }
     Ok(())
+}
+
+/// Time a TCP connect to each peer, which is the only distance Drop has.
+///
+/// A connect rather than a ping: ICMP is often filtered, and what matters is
+/// whether the port answers, which is the same question a transfer asks.
+pub async fn measure(peers: &Peers) {
+    use std::time::Instant;
+    let snapshot: Vec<(String, String, u16)> = peers
+        .read()
+        .await
+        .iter()
+        .map(|(key, p)| (key.clone(), p.host.clone(), p.port))
+        .collect();
+
+    for (key, host, port) in snapshot {
+        let started = Instant::now();
+        let reached = tokio::time::timeout(
+            std::time::Duration::from_millis(1200),
+            tokio::net::TcpStream::connect((host.as_str(), port)),
+        )
+        .await
+        .ok()
+        .and_then(|r| r.ok())
+        .is_some();
+        let ms = reached.then(|| started.elapsed().as_millis().min(9_999) as u32);
+        if let Some(peer) = peers.write().await.get_mut(&key) {
+            peer.ms = ms;
+        }
+    }
 }
 
 /// Browse for `wait` and return whatever answered — used by `drop peers`

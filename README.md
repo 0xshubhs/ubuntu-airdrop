@@ -246,6 +246,34 @@ drop send thinkpad --text "some notes"  # a snippet
 wl-paste | drop send thinkpad --text -  # the clipboard
 ```
 
+## Devices nearby
+
+The Drop window draws the other machines on a radar, as omdrop does. omdrop places a
+device by radio signal strength; Drop has no radio of its own to ask, so a dot sits by
+how quickly the device answers a TCP connect to its port. Nearer the middle answers
+faster. A device that does not answer at all waits on the rim.
+
+The round trip is measured every five seconds, and the connect is the same question a
+transfer asks, which is why it is a connect and not a ping: ICMP is filtered on plenty
+of networks where transfers work fine. A device keeps its bearing for as long as it
+keeps its name, so dots do not shuffle between refreshes, and two machines that answer
+in the same millisecond are walked apart far enough for both names to be legible.
+
+Clicking a dot, or its row in the list beside the radar, opens the file chooser and
+pushes what you pick straight to that machine: the same path `drop send` takes.
+
+Two settings that used to mean editing the config file are in the window as well:
+
+- **They see you as**, the name on the phone and in other devices' lists. Changing it
+  takes the mDNS advertisement down and puts a fresh one up, so other machines see the
+  new name within a second or two.
+- **Save files to**, with a folder chooser.
+
+```bash
+drop name "Study Mac"
+drop dir ~/Drops
+```
+
 ## CLI
 
 ```bash
@@ -255,6 +283,8 @@ drop off                        # stop taking them now
 drop visible once               # what "on" means from now on
 drop limit 30                   # largest transfer, as % of the free space
 drop doctor                     # what is in the way, and how to fix it
+drop name "Study Mac"           # the name other devices see
+drop dir ~/Drops                # where received files land
 drop panel                      # open the Drop window
 drop qr                         # QR + PIN for pairing a phone
 drop open                       # open the Drop folder

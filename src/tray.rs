@@ -765,6 +765,23 @@ async fn attach(port: u16) -> Result<ksni::Handle<DropTray>> {
 /// installed or the user cancelled.
 ///
 /// Blocks until the dialog closes, so callers must keep it off the runtime.
+/// The folder chooser, for "Save files to".
+pub fn pick_folder() -> Option<String> {
+    let out = Command::new("zenity")
+        .args([
+            "--file-selection",
+            "--directory",
+            "--title=Where should Drop save files?",
+        ])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let picked = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!picked.is_empty()).then_some(picked)
+}
+
 pub fn pick_files() -> Option<Vec<String>> {
     let out = Command::new("zenity")
         .args([

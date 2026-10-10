@@ -52,6 +52,14 @@ enum Cmd {
     },
     /// Stop receiving now
     Off,
+    /// Set the name other devices see
+    Name {
+        name: String,
+    },
+    /// Set where received files land
+    Dir {
+        path: String,
+    },
     /// Largest transfer, as a percentage of the free space (0 lifts it)
     Limit {
         pct: u8,
@@ -150,6 +158,25 @@ async fn main() -> Result<()> {
             )
             .await?;
             report(cfg.port).await
+        }
+
+        Cmd::Name { name } => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            control(cfg.port, "/api/control/name", serde_json::json!({"name": name})).await?;
+            println!("  they see you as {}", name.trim());
+            Ok(())
+        }
+
+        Cmd::Dir { path } => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            let out = control(cfg.port, "/api/control/dir", serde_json::json!({"path": path})).await?;
+            println!(
+                "  saving to {}",
+                out.get("dir").and_then(|d| d.as_str()).unwrap_or(&path)
+            );
+            Ok(())
         }
 
         Cmd::Limit { pct } => {

@@ -72,8 +72,30 @@ pub const PANEL: &str = r####"<!doctype html>
   button.act:hover:not(:disabled){background:var(--signal); border-color:var(--signal)}
   button.act:disabled{opacity:.35; cursor:default}
 
+  input.act{font:inherit; font-size:.82rem; padding:.4rem .5rem; border:1px solid var(--rule);
+        background:transparent; color:inherit; border-radius:7px; width:11rem; text-align:right}
+  input.act:focus{outline:none; border-color:var(--signal)}
   select.act{font:inherit; font-size:.82rem; padding:.4rem .5rem; border:1px solid var(--rule);
         background:transparent; color:inherit; border-radius:7px; cursor:pointer}
+
+  /* Radar. omdrop places a device by radio signal; Drop has none, so the
+     ring is the round trip to its port, which is the nearest honest thing. */
+  .radar{display:flex; gap:1.1rem; align-items:center; margin:.2rem 0 .4rem}
+  .radar svg{flex:none; width:190px; height:190px}
+  .radar .ring{fill:none; stroke:var(--rule)}
+  .radar .sweep{transform-origin:50% 50%; animation:spin 4s linear infinite}
+  @media (prefers-reduced-motion:reduce){ .radar .sweep{animation:none; opacity:.35} }
+  @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+  .radar .blip{cursor:pointer}
+  .radar .blip circle{fill:var(--live)}
+  .radar .blip:hover circle{fill:var(--signal)}
+  .radar .blip text{font-size:9px; fill:var(--muted)}
+  .radar .blip:hover text{fill:var(--ink)}
+  .radar .none{font-size:.8rem; color:var(--muted)}
+  .radar .legend{min-width:0}
+  .radar .legend li{list-style:none; font-size:.82rem; padding:.2rem 0; cursor:pointer}
+  .radar .legend li:hover .name{color:var(--signal)}
+  .radar .legend .meta{display:block; color:var(--muted); font-size:.72rem}
 
   /* The window, at the top, because nothing below it matters while it is shut. */
   .gate{display:flex; align-items:center; justify-content:space-between; gap:1rem;
@@ -157,6 +179,16 @@ pub const PANEL: &str = r####"<!doctype html>
 
 <h2>Settings</h2>
 <div class="row">
+  <span class="label">They see you as
+    <small>The name on the phone and in other devices' lists</small></span>
+  <input class="act" id="t-name" maxlength="32" spellcheck="false">
+</div>
+<div class="row">
+  <span class="label">Save files to
+    <small id="dir-pick-note"></small></span>
+  <button class="act" id="b-dir">Choose…</button>
+</div>
+<div class="row">
   <span class="label">Stay visible for
     <small>How long the switch above stays on</small></span>
   <select class="act" id="s-span"></select>
@@ -226,7 +258,23 @@ pub const PANEL: &str = r####"<!doctype html>
 <ul id="files"></ul>
 
 <h2>Devices nearby</h2>
-<ul id="peers"></ul>
+<div class="radar">
+  <svg id="radar" viewBox="0 0 200 200" aria-label="Nearby Drop devices, placed by how quickly they answer">
+    <circle class="ring" cx="100" cy="100" r="92"></circle>
+    <circle class="ring" cx="100" cy="100" r="62"></circle>
+    <circle class="ring" cx="100" cy="100" r="32"></circle>
+    <line class="ring" x1="100" y1="8" x2="100" y2="192"></line>
+    <line class="ring" x1="8" y1="100" x2="192" y2="100"></line>
+    <g class="sweep">
+      <line x1="100" y1="100" x2="100" y2="10" stroke="var(--live)" stroke-width="1.5"></line>
+    </g>
+    <g id="blips"></g>
+  </svg>
+  <div class="legend">
+    <ul id="peers"></ul>
+    <p class="hint">Nearer the middle answers faster. Click a device to send it files.</p>
+  </div>
+</div>
 
 <footer class="mono" id="foot"></footer>
 <div class="toast" id="toast"></div>
@@ -260,6 +308,12 @@ async function post(path, body){
 
 $('#pin').onclick = () => last && copy(last.pin);
 $('#b-open').onclick = () => post('/api/control/open');
+$('#b-dir').onclick  = () => post('/api/control/dir-picker');
+// On blur, not on every keystroke: renaming re-advertises over mDNS.
+$('#t-name').onchange = e => {
+  const name = e.target.value.trim();
+  if (name) post('/api/control/name', {name}); else refresh();
+};
 $('#b-move').onclick = () => post('/api/control/move-all').then(() => toast('Moved'));
 $('#b-pin').onclick  = () => { if (confirm('Generate a new PIN? Every signed-in device is logged out.')) post('/api/control/pin'); };
 $('#t-recv').onchange     = e => post('/api/control/receiving', {enabled: e.target.checked});
@@ -283,6 +337,76 @@ function windowNote(s){
     ? 'Until one file arrives' : 'Until you turn it off';
   return s.off_because && s.off_because !== 'off'
     ? 'Off, ' + s.off_because : 'Nothing can reach this computer';
+}
+
+// A device keeps the same bearing for as long as it keeps its name, so dots
+// do not shuffle between refreshes. omdrop does this off the MAC; Drop has a
+// name and an address, which is as stable here.
+function bearing(key){
+  let h = 0;
+  for (const ch of key) h = (h * 31 + ch.charCodeAt(0)) % 360;
+  return h;
+}
+
+// Round trip to radius: 0 ms sits just off centre, 400 ms or worse is the rim,
+// and a device that did not answer at all waits on the rim itself.
+function reach(ms){
+  if (ms == null) return 1;
+  return Math.max(0.12, Math.min(1, Math.sqrt(ms / 400)));
+}
+
+// Two machines on the same desk answer in the same millisecond and would be
+// drawn on the same spot, one label over the other. Walk a dot outwards along
+// its own bearing until it has room, which keeps the ring it sits on roughly
+// honest while making both readable.
+function place(peers){
+  const put = [];
+  for (const p of peers){
+    let angle = bearing(p.label + p.host) * Math.PI / 180;
+    let r = 8 + reach(p.ms) * 84;
+    let x = 0, y = 0;
+    for (let tries = 0; tries < 14; tries++){
+      x = 100 + Math.sin(angle) * r;
+      y = 100 - Math.cos(angle) * r;
+      // A dot carries its name beside it, so the space it needs is a wide,
+      // short box rather than a circle: keep them further apart across than
+      // down, or two names sit on one line.
+      if (!put.some(q => Math.hypot((q.x - x) / 46, (q.y - y) / 13) < 1)) break;
+      angle += 0.5;
+      r = Math.min(90, r + 9);
+    }
+    put.push({x, y, peer: p});
+  }
+  return put;
+}
+
+function drawRadar(peers){
+  const blips = $('#blips');
+  blips.innerHTML = place(peers).map((d, i) => {
+    const flip = d.x > 100 ? 'end' : 'start';
+    const tx = d.x + (d.x > 100 ? -7 : 7);
+    return `<g class="blip" data-peer="${i}">`
+      + `<circle cx="${d.x.toFixed(1)}" cy="${d.y.toFixed(1)}" r="4.5"></circle>`
+      + `<text x="${tx.toFixed(1)}" y="${(d.y + 3).toFixed(1)}" text-anchor="${flip}">`
+      + `${esc(d.peer.label)}</text></g>`;
+  }).join('');
+  blips.querySelectorAll('.blip').forEach(g => {
+    g.onclick = () => sendTo(peers[Number(g.dataset.peer)]);
+  });
+}
+
+// Push files straight to another Drop machine, as `drop send` does.
+async function sendTo(peer){
+  if (!peer) return;
+  toast('Choose files for ' + peer.label);
+  const r = await fetch('/api/control/send-to', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({host: peer.host, port: peer.port, label: peer.label}),
+  });
+  const out = await r.json().catch(() => ({}));
+  if (out.cancelled) return;
+  toast(r.ok ? 'Sent to ' + peer.label : (out.error || 'Could not send'));
+  refresh();
 }
 
 function bytes(n){
@@ -357,6 +481,9 @@ async function refresh(){
   }
   if (document.activeElement !== sel) sel.value = s.visible_for || 'always';
 
+  if (document.activeElement !== $('#t-name')) $('#t-name').value = s.name || '';
+  $('#dir-pick-note').textContent = s.dir || '';
+
   const lim = $('#s-limit');
   if (document.activeElement !== lim) lim.value = String(s.limit_pct ?? 30);
   $('#limit-note').textContent = s.limit_bytes != null
@@ -395,10 +522,16 @@ async function refresh(){
         + `<span class="meta mono">${esc(f.size)} · ${esc(f.when)}</span></li>`).join('')
     : '<li class="empty">Nothing yet.</li>';
 
-  $('#peers').innerHTML = s.peers_list && s.peers_list.length
-    ? s.peers_list.map(p => `<li><span class="dot"></span><span class="name">${esc(p.label)}</span>`
-        + `<span class="meta mono">${esc(p.host)}:${p.port}</span></li>`).join('')
+  const nearby = s.peers_list || [];
+  drawRadar(nearby);
+  $('#peers').innerHTML = nearby.length
+    ? nearby.map((p, i) => `<li data-peer="${i}"><span class="name">${esc(p.label)}</span>`
+        + `<span class="meta mono">${esc(p.host)}:${p.port}`
+        + `${p.ms != null ? ' · ' + p.ms + ' ms' : ' · no answer'}</span></li>`).join('')
     : '<li class="empty">No other devices advertising.</li>';
+  $('#peers').querySelectorAll('li[data-peer]').forEach(li => {
+    li.onclick = () => sendTo(nearby[Number(li.dataset.peer)]);
+  });
 
   drawConnected(s.connected || [], Math.floor(Date.now() / 1000));
 
