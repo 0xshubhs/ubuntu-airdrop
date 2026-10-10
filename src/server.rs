@@ -36,6 +36,16 @@ pub struct Received {
     pub when: String,
 }
 
+/// What finished arriving most recently.
+#[derive(Debug, Clone, Serialize)]
+pub struct Arrival {
+    pub path: PathBuf,
+    /// An http(s) address, when what arrived was a shared link.
+    pub link: Option<String>,
+    /// How many files came in that transfer.
+    pub count: usize,
+}
+
 pub struct App {
     pub cfg: RwLock<Config>,
     pub peers: Peers,
@@ -50,6 +60,9 @@ pub struct App {
     pub shared_text: RwLock<String>,
     /// Browsers currently past the PIN.
     pub sessions: crate::sessions::Registry,
+    /// The last thing to arrive, so the notification can offer to open it
+    /// rather than only the folder it went into.
+    pub last_arrival: RwLock<Option<Arrival>>,
     /// Whether this machine is taking arrivals, and for how much longer.
     pub window: RwLock<Window>,
     /// The mDNS handle, kept so the advertisement can be withdrawn as well as
@@ -422,13 +435,26 @@ async fn receive_text(
                 cfg.dir.clone()
             }
         };
-        let landed = relocate(&stage.join(&name), &dest).await.is_ok();
+        let saved_at = relocate(&stage.join(&name), &dest).await;
         let _ = tokio::fs::remove_dir_all(&stage).await;
-        if !landed {
+        let Ok(saved_at) = saved_at else {
             return (StatusCode::INTERNAL_SERVER_ERROR, "cannot save").into_response();
-        }
-        to_clipboard(&body);
+        };
         note_received(&app, &name, body.len() as u64).await;
+        landed(&app, std::slice::from_ref(&saved_at)).await;
+        // The snippet itself beats the file it was written to, and a snippet
+        // that is only a link is the link.
+        match crate::links::in_text(&body) {
+            Some(url) => {
+                to_clipboard(&url);
+                *app.last_arrival.write().await = Some(Arrival {
+                    path: saved_at,
+                    link: Some(url),
+                    count: 1,
+                });
+            }
+            None => to_clipboard(&body),
+        }
         println!("  <- text ({} bytes) from {device}", body.len());
         return Json(json!({"status": "saved", "name": name})).into_response();
     }
@@ -573,11 +599,33 @@ async fn unshare(
 
 /// Put a snippet on the desktop clipboard. Best effort: wl-copy is only a
 /// recommended dependency, and a headless session has no clipboard at all.
+/// Put the files themselves on the clipboard, as `text/uri-list`, which is
+/// what a file manager, a browser or a chat window pastes as an attachment.
+fn files_to_clipboard(paths: &[PathBuf]) {
+    let list: String = paths
+        .iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .map(|p| format!("file://{}\r\n", p.display()))
+        .collect();
+    if list.is_empty() {
+        return;
+    }
+    clipboard_write(&list, Some("text/uri-list"));
+}
+
 fn to_clipboard(text: &str) {
+    clipboard_write(text, None);
+}
+
+fn clipboard_write(body: &str, mime: Option<&str>) {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    let Ok(mut child) = Command::new("wl-copy")
+    let mut cmd = Command::new("wl-copy");
+    if let Some(mime) = mime {
+        cmd.args(["--type", mime]);
+    }
+    let Ok(mut child) = cmd
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -586,7 +634,7 @@ fn to_clipboard(text: &str) {
         return;
     };
     if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(text.as_bytes());
+        let _ = stdin.write_all(body.as_bytes());
     }
     // wl-copy forks a server to own the selection; do not block on it.
     std::thread::spawn(move || {
@@ -890,6 +938,7 @@ async fn drain(
     };
 
     let mut saved = Vec::new();
+    let mut landed_at = Vec::new();
     for f in written {
         let mut path = dir.join(&f.name);
         if auto_move {
@@ -903,8 +952,10 @@ async fn drain(
             .unwrap_or_default();
         println!("  <- {name}  ({})", human_size(f.size));
         note_received(app, &name, f.size).await;
+        landed_at.push(path);
         saved.push(name);
     }
+    landed(app, &landed_at).await;
     Json(json!({"saved": saved})).into_response()
 }
 
@@ -918,6 +969,41 @@ async fn note_received(app: &Arc<App>, name: &str, size: u64) {
     recent.truncate(RECENT_MAX);
     drop(recent);
     app.counter.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Everything that happens once a batch has finished arriving.
+///
+/// One place rather than four, because a transfer is one event however many
+/// files it carried: the clipboard is set once, a "one file" window closes
+/// once, and the notification has one thing to offer opening.
+async fn landed(app: &Arc<App>, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+
+    // A link shared from a phone arrives as a one-line file. Read it now,
+    // while we know which file it was.
+    let mut link = None;
+    if paths.len() == 1
+        && let Some(name) = paths[0].file_name().map(|n| n.to_string_lossy().to_string())
+        && let Ok(body) = tokio::fs::read_to_string(&paths[0]).await
+    {
+        link = crate::links::in_file(&name, &body);
+    }
+
+    // What the clipboard gets: the link itself when that is what arrived,
+    // otherwise the files, so a paste into a chat window sends them on.
+    match &link {
+        Some(url) => to_clipboard(url),
+        None => files_to_clipboard(paths),
+    }
+
+    *app.last_arrival.write().await = Some(Arrival {
+        path: paths[0].clone(),
+        link,
+        count: paths.len(),
+    });
+
     // "One file" means this one: the window closes behind it.
     if app.window.write().await.arrived() {
         println!("  receiving off ({})", Shut::OneFile.say());
@@ -1039,6 +1125,7 @@ async fn status(
         "limit_pct": cfg.limit_pct,
         "limit_bytes": crate::disk::budget_for(&cfg.dir, cfg.limit_pct),
         "free_bytes": crate::disk::free_bytes(&cfg.dir),
+        "last_arrival": app.last_arrival.read().await.clone(),
         "receiving": receiving,
         "remaining": remaining,
         "once": once,
@@ -1160,6 +1247,7 @@ async fn decide_offer(
     let dest = if auto_move { target } else { dir };
 
     let mut saved = Vec::new();
+    let mut landed_at = Vec::new();
     if let Ok(mut rd) = tokio::fs::read_dir(&stage).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             let from = entry.path();
@@ -1171,16 +1259,31 @@ async fn decide_offer(
                     .unwrap_or_default();
                 println!("  <- {name}  ({})", human_size(size));
                 note_received(&app, &name, size).await;
+                landed_at.push(moved);
                 saved.push(name);
             }
         }
     }
     let _ = tokio::fs::remove_dir_all(&stage).await;
+    landed(&app, &landed_at).await;
 
     // A snippet is saved like a file, but the point of sending one is usually
-    // to paste it, so put it on the clipboard too.
+    // to paste it, so put it on the clipboard too. A snippet that is nothing
+    // but a link is treated as the link it is.
     if let Some(text) = &offer.text {
-        to_clipboard(text);
+        match crate::links::in_text(text) {
+            Some(url) => {
+                to_clipboard(&url);
+                if let Some(path) = landed_at.first() {
+                    *app.last_arrival.write().await = Some(Arrival {
+                        path: path.clone(),
+                        link: Some(url),
+                        count: 1,
+                    });
+                }
+            }
+            None => to_clipboard(text),
+        }
     }
 
     app.offers
@@ -1704,6 +1807,7 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg: RwLock::new(cfg.clone()),
         shared_text: RwLock::new(String::new()),
         sessions: Default::default(),
+        last_arrival: RwLock::new(None),
         window: RwLock::new(Window::new(cfg.span())),
         mdns: mdns.clone(),
         advert: RwLock::new(None),

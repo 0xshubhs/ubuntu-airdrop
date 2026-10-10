@@ -5,6 +5,7 @@ mod config;
 mod discovery;
 mod disk;
 mod doctor;
+mod links;
 mod net;
 mod offers;
 mod page;

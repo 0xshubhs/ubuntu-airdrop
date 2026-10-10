@@ -116,6 +116,25 @@ to reach us to collect it. omdrop behaves the same way when you send with receiv
 `visible_for` in `~/.config/drop/config.json` remembers the choice. It defaults to
 `always`, so an upgrade does not quietly stop a phone that has worked for months.
 
+## When something lands
+
+A transfer is one event, however many files it carried, so three things happen once:
+
+- **It goes on the clipboard.** Files as `text/uri-list`, which is what a file manager, a
+  browser or a chat window pastes as an attachment, so forwarding what just arrived is a
+  paste rather than a hunt through a folder. A snippet goes on as text, as it always did.
+- **The notification offers the thing itself**, not the folder it went into: *Open file*
+  for a single arrival, *Open folder* for a batch.
+- **A shared link is treated as a link.** Apple devices share one as a tiny `.webloc`
+  file and Windows as a `.url`; either way the address is read out and the notification
+  says *Open link*, naming the host.
+
+Only `http` and `https` ever open. A `.webloc` holding `file:///etc/shadow` still saves
+as a file, but Drop will not offer to open it, because the address was chosen by whoever
+sent it, and a one-click `file://` is a way to make someone open something on their own
+machine without meaning to. A snippet that is nothing but a link counts as a link, since
+that is how a phone usually sends one.
+
 ## Largest transfer
 
 A phone with a full camera roll can fill a disk in one go, and the first sign of it is
@@ -259,8 +278,11 @@ of networks where transfers work fine. A device keeps its bearing for as long as
 keeps its name, so dots do not shuffle between refreshes, and two machines that answer
 in the same millisecond are walked apart far enough for both names to be legible.
 
-Clicking a dot, or its row in the list beside the radar, opens the file chooser and
-pushes what you pick straight to that machine: the same path `drop send` takes.
+Two kinds of device share the radar. A filled dot is another Drop machine, found over
+mDNS: clicking it opens the file chooser and pushes what you pick straight there, the
+same path `drop send` takes. A hollow ring is a phone on the page right now, which
+cannot be pushed to at all, because a browser has no inbox: clicking that one puts files
+up for it to collect.
 
 Two settings that used to mean editing the config file are in the window as well:
 

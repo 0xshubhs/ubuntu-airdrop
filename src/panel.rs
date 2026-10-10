@@ -88,6 +88,10 @@ pub const PANEL: &str = r####"<!doctype html>
   @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
   .radar .blip{cursor:pointer}
   .radar .blip circle{fill:var(--live)}
+  /* A phone on the page is not another Drop machine: it cannot be pushed to,
+     only handed something to collect. Hollow, so the difference is visible. */
+  .radar .blip.here circle{fill:var(--paper); stroke:var(--live); stroke-width:2}
+  .radar .blip.here:hover circle{stroke:var(--signal)}
   .radar .blip:hover circle{fill:var(--signal)}
   .radar .blip text{font-size:9px; fill:var(--muted)}
   .radar .blip:hover text{fill:var(--ink)}
@@ -355,44 +359,69 @@ function reach(ms){
   return Math.max(0.12, Math.min(1, Math.sqrt(ms / 400)));
 }
 
+// A name longer than this is cut on the radar; the list beside it has the
+// whole thing, and a dot is not where you read a long name.
+function label(p){
+  return p.label.length > 14 ? p.label.slice(0, 13) + '…' : p.label;
+}
+
+// What a dot occupies: the dot, and its name drawn to one side. Roughly
+// 4.6 units per character at this font size, which is close enough to keep
+// two names off the same line.
+function boxOf(x, y, text){
+  const half = 9 + text.length * 4.6;
+  return {x0: x - half, x1: x + half, y0: y - 7, y1: y + 7};
+}
+
+function hits(a, b){
+  return a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+}
+
 // Two machines on the same desk answer in the same millisecond and would be
-// drawn on the same spot, one label over the other. Walk a dot outwards along
-// its own bearing until it has room, which keeps the ring it sits on roughly
-// honest while making both readable.
+// drawn on the same spot, one name over the other. Walk a dot outwards along
+// its own bearing until its box is clear, which keeps the ring it sits on
+// roughly honest while making both readable.
 function place(peers){
   const put = [];
   for (const p of peers){
     let angle = bearing(p.label + p.host) * Math.PI / 180;
     let r = 8 + reach(p.ms) * 84;
-    let x = 0, y = 0;
-    for (let tries = 0; tries < 14; tries++){
+    let x = 0, y = 0, box = null;
+    for (let tries = 0; tries < 18; tries++){
       x = 100 + Math.sin(angle) * r;
       y = 100 - Math.cos(angle) * r;
-      // A dot carries its name beside it, so the space it needs is a wide,
-      // short box rather than a circle: keep them further apart across than
-      // down, or two names sit on one line.
-      if (!put.some(q => Math.hypot((q.x - x) / 46, (q.y - y) / 13) < 1)) break;
-      angle += 0.5;
-      r = Math.min(90, r + 9);
+      box = boxOf(x, y, label(p));
+      if (!put.some(q => hits(q.box, box))) break;
+      angle += 0.55;
+      r = Math.min(88, r + 11);
     }
-    put.push({x, y, peer: p});
+    put.push({x, y, box, peer: p});
   }
   return put;
 }
 
-function drawRadar(peers){
+function drawRadar(marks){
   const blips = $('#blips');
-  blips.innerHTML = place(peers).map((d, i) => {
+  blips.innerHTML = place(marks).map((d, i) => {
     const flip = d.x > 100 ? 'end' : 'start';
     const tx = d.x + (d.x > 100 ? -7 : 7);
-    return `<g class="blip" data-peer="${i}">`
+    return `<g class="blip ${d.peer.here ? 'here' : ''}" data-peer="${i}">`
       + `<circle cx="${d.x.toFixed(1)}" cy="${d.y.toFixed(1)}" r="4.5"></circle>`
       + `<text x="${tx.toFixed(1)}" y="${(d.y + 3).toFixed(1)}" text-anchor="${flip}">`
-      + `${esc(d.peer.label)}</text></g>`;
+      + `${esc(label(d.peer))}</text></g>`;
   }).join('');
   blips.querySelectorAll('.blip').forEach(g => {
-    g.onclick = () => sendTo(peers[Number(g.dataset.peer)]);
+    g.onclick = () => reach_out(marks[Number(g.dataset.peer)]);
   });
+}
+
+// Two kinds of device, two things a click can mean. Another Drop machine is
+// pushed to; a phone on the page is handed something to collect, because a
+// browser cannot be pushed to at all.
+function reach_out(mark){
+  if (!mark) return;
+  if (mark.here) { post('/api/control/share-files-picker'); toast('Choose what to offer ' + mark.label); }
+  else sendTo(mark);
 }
 
 // Push files straight to another Drop machine, as `drop send` does.
@@ -522,15 +551,23 @@ async function refresh(){
         + `<span class="meta mono">${esc(f.size)} · ${esc(f.when)}</span></li>`).join('')
     : '<li class="empty">Nothing yet.</li>';
 
-  const nearby = s.peers_list || [];
-  drawRadar(nearby);
-  $('#peers').innerHTML = nearby.length
-    ? nearby.map((p, i) => `<li data-peer="${i}"><span class="name">${esc(p.label)}</span>`
-        + `<span class="meta mono">${esc(p.host)}:${p.port}`
-        + `${p.ms != null ? ' · ' + p.ms + ' ms' : ' · no answer'}</span></li>`).join('')
+  // Both kinds of device share the radar: Drop machines found over mDNS,
+  // and phones that are on the page right now.
+  const nearby = (s.peers_list || []).map(p => ({...p, here: false}));
+  const here = (s.connected || []).map(c => ({
+    label: c.device, host: c.ip, port: s.port, ms: 0, here: true,
+  }));
+  const marks = here.concat(nearby);
+  drawRadar(marks);
+  $('#peers').innerHTML = marks.length
+    ? marks.map((p, i) => `<li data-peer="${i}"><span class="name">${esc(p.label)}`
+        + `${p.here ? ' <small>on the page</small>' : ''}</span>`
+        + `<span class="meta mono">${esc(p.host)}${p.here ? '' : ':' + p.port}`
+        + `${p.here ? ' · hand it something' : (p.ms != null ? ' · ' + p.ms + ' ms' : ' · no answer')}`
+        + `</span></li>`).join('')
     : '<li class="empty">No other devices advertising.</li>';
   $('#peers').querySelectorAll('li[data-peer]').forEach(li => {
-    li.onclick = () => sendTo(nearby[Number(li.dataset.peer)]);
+    li.onclick = () => reach_out(marks[Number(li.dataset.peer)]);
   });
 
   drawConnected(s.connected || [], Math.floor(Date.now() / 1000));

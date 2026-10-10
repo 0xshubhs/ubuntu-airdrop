@@ -20,6 +20,15 @@ pub struct OfferFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+pub struct Arrival {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub link: Option<String>,
+    #[serde(default)]
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 pub struct Connected {
     pub device: String,
     #[serde(default)]
@@ -76,6 +85,9 @@ pub struct Status {
     /// This window closes behind the next arrival.
     #[serde(default)]
     pub once: bool,
+    /// The last thing to arrive, which is what a notification offers to open.
+    #[serde(default)]
+    pub last_arrival: Option<Arrival>,
 }
 
 #[derive(Debug)]
@@ -850,7 +862,7 @@ pub async fn run(port: u16) -> Result<()> {
                     // Point at where the files actually are: with auto-move on
                     // they never sit in the Drop folder.
                     let landed = if s.auto_move { &s.move_target } else { &s.dir };
-                    notify(s.received - prev, landed);
+                    notify(s.received - prev, landed, s.last_arrival.as_ref());
                     seen = Some(s.received);
                 }
                 _ => {}
@@ -986,30 +998,62 @@ fn notify_connected(device: &str, port: u16) {
     });
 }
 
-fn notify(count: u64, dir: &std::path::Path) {
+/// Say what arrived, and offer to open the thing itself.
+///
+/// omdrop opens the file, or the link when a link is what was shared, rather
+/// than dropping you in a folder to go and find it. A link only opens when it
+/// is http or https, which `links::safe` has already decided by this point:
+/// the address came from whoever sent it, not from here.
+fn notify(count: u64, dir: &std::path::Path, last: Option<&Arrival>) {
     let where_ = dir
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| dir.display().to_string());
-    let body = match count {
-        1 => format!("1 new file in {where_}"),
-        n => format!("{n} new files in {where_}"),
+
+    let one = last.filter(|a| count == 1 && a.count == 1);
+    let link = one.and_then(|a| a.link.clone());
+    let file = one.map(|a| a.path.clone());
+    let name = file
+        .as_ref()
+        .and_then(|p| p.file_name())
+        .map(|n| n.to_string_lossy().to_string());
+
+    let (body, label, icon) = match (&link, &name) {
+        (Some(url), _) => (
+            format!("Link from a device: {}", crate::links::host_of(url)),
+            "Open link",
+            "emblem-web",
+        ),
+        (None, Some(name)) => (format!("{name} in {where_}"), "Open file", "folder-download"),
+        (None, None) => (
+            match count {
+                1 => format!("1 new file in {where_}"),
+                n => format!("{n} new files in {where_}"),
+            },
+            "Open folder",
+            "folder-download",
+        ),
     };
 
-    let dir = dir.to_path_buf();
+    let target: std::ffi::OsString = match (&link, &file) {
+        (Some(url), _) => url.into(),
+        (None, Some(path)) => path.into(),
+        (None, None) => dir.into(),
+    };
+
     std::thread::spawn(move || {
         let out = Command::new("notify-send")
             .args([
                 "--app-name=Drop",
-                "--icon=folder-download",
-                "--action=open=Open folder",
+                &format!("--icon={icon}"),
+                &format!("--action=open={label}"),
                 "Drop",
                 &body,
             ])
             .output();
         if let Ok(out) = out {
             if String::from_utf8_lossy(&out.stdout).trim() == "open" {
-                let _ = Command::new("xdg-open").arg(&dir).spawn();
+                let _ = Command::new("xdg-open").arg(&target).spawn();
             }
         }
     });
