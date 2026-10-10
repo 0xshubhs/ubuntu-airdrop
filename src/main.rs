@@ -4,6 +4,7 @@ mod auth;
 mod config;
 mod discovery;
 mod disk;
+mod doctor;
 mod net;
 mod offers;
 mod page;
@@ -90,6 +91,8 @@ enum Cmd {
     Open,
     /// Print this device's PIN and address
     Status,
+    /// Check what is standing in the way of a transfer
+    Doctor,
     /// Generate a new PIN, invalidating existing sessions
     Pin,
 }
@@ -290,6 +293,17 @@ async fn main() -> Result<()> {
                 "  tunnel     {}",
                 if cfg.tunnel { "on" } else { "off" }
             );
+            Ok(())
+        }
+
+        Cmd::Doctor => {
+            let cfg = Config::load()?;
+            println!("\n  Drop {}  on  {}\n", env!("CARGO_PKG_VERSION"), cfg.name);
+            let findings = doctor::run(&cfg).await;
+            for f in &findings {
+                println!("{f}");
+            }
+            print!("{}", doctor::verdict(&findings));
             Ok(())
         }
 

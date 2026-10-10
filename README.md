@@ -254,6 +254,7 @@ drop on 15m                     # take arrivals for fifteen minutes
 drop off                        # stop taking them now
 drop visible once               # what "on" means from now on
 drop limit 30                   # largest transfer, as % of the free space
+drop doctor                     # what is in the way, and how to fix it
 drop panel                      # open the Drop window
 drop qr                         # QR + PIN for pairing a phone
 drop open                       # open the Drop folder
@@ -335,6 +336,33 @@ front of your Drop folder, so:
 - sessions are HMAC-signed cookies; `New PIN` rotates the signing key and logs everyone out
 
 Off by default. Leave it off unless you need it.
+
+## When it does not work
+
+`drop doctor` walks the chain a transfer needs, most fundamental first, and says what to
+do about whatever is in the way. It runs as you, with no root anywhere.
+
+```
+  Drop 0.1.0  on  keshava
+
+  ok  daemon     answering on 127.0.0.1:8420
+  ok  folder     /home/krsna/Drop, 444.4 GB free
+  ok  address    http://192.168.0.113:8420
+  no  receiving  off, so arrivals are refused and nothing is advertised
+                 drop on
+  hm  firewall   ufw is running; if the phone cannot reach you, the port is the first suspect
+                 sudo ufw allow 8420/tcp
+  ok  mdns       avahi is running, so names resolve on the LAN
+  ok  tray       the indicator is up
+  ok  tunnel     https://neat-words-here.trycloudflare.com
+  ok  helpers    notifications, picker and clipboard all present
+
+  receiving is what to fix first.
+```
+
+`no` stops a transfer, `hm` is worth knowing, and the indented line under either is the
+command that fixes it. The idea is omdrop's `omdrop-discoverable probe`, which answers
+the same question: which link in the chain is broken.
 
 ## Security notes
 
