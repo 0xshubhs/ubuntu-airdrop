@@ -162,6 +162,17 @@ pub const PANEL: &str = r####"<!doctype html>
   <select class="act" id="s-span"></select>
 </div>
 <div class="row">
+  <span class="label">Largest transfer
+    <small id="limit-note"></small></span>
+  <select class="act" id="s-limit">
+    <option value="10">10% of free space</option>
+    <option value="30">30% of free space</option>
+    <option value="50">50% of free space</option>
+    <option value="80">80% of free space</option>
+    <option value="0">No cap</option>
+  </select>
+</div>
+<div class="row">
   <span class="label">Reachable from the internet
     <small id="tunnel-note">Off — this network only</small></span>
   <label class="sw"><input type="checkbox" id="t-tunnel"><i></i></label>
@@ -253,6 +264,7 @@ $('#b-move').onclick = () => post('/api/control/move-all').then(() => toast('Mov
 $('#b-pin').onclick  = () => { if (confirm('Generate a new PIN? Every signed-in device is logged out.')) post('/api/control/pin'); };
 $('#t-recv').onchange     = e => post('/api/control/receiving', {enabled: e.target.checked});
 $('#s-span').onchange     = e => post('/api/control/visible-for', {spec: e.target.value});
+$('#s-limit').onchange    = e => post('/api/control/limit', {pct: Number(e.target.value)});
 $('#t-tunnel').onchange   = e => post('/api/control/tunnel', {enabled: e.target.checked});
 $('#t-move').onchange     = e => post('/api/control/auto-move', {enabled: e.target.checked});
 $('#t-approval').onchange = e => post('/api/control/approval', {enabled: e.target.checked});
@@ -344,6 +356,12 @@ async function refresh(){
       `<option value="${esc(o.spec)}">${esc(o.label)}</option>`).join('');
   }
   if (document.activeElement !== sel) sel.value = s.visible_for || 'always';
+
+  const lim = $('#s-limit');
+  if (document.activeElement !== lim) lim.value = String(s.limit_pct ?? 30);
+  $('#limit-note').textContent = s.limit_bytes != null
+    ? bytes(s.limit_bytes) + ' right now, of ' + bytes(s.free_bytes) + ' free'
+    : (s.free_bytes != null ? bytes(s.free_bytes) + ' free' : '');
 
   const pub = s.tunnel_url;
   const ap = $('#a-public');

@@ -32,6 +32,10 @@ pub struct Config {
     /// straight into `dir`. This is the AirDrop behaviour.
     #[serde(default = "yes")]
     pub require_approval: bool,
+    /// The largest transfer, as a percentage of the free space on the Drop
+    /// folder's filesystem. 0 lifts the cap. omdrop's `limit`.
+    #[serde(default = "limit_pct")]
+    pub limit_pct: u8,
     /// How long turning receiving on lasts: "always" for no window at all,
     /// "once" for one file, or a duration like "15m". See `window::Span`.
     #[serde(default = "always")]
@@ -52,6 +56,7 @@ impl Default for Config {
             move_target: dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
             tunnel: false,
             require_approval: true,
+            limit_pct: limit_pct(),
             visible_for: always(),
             secret: random_hex(32),
         }
@@ -60,6 +65,12 @@ impl Default for Config {
 
 fn yes() -> bool {
     true
+}
+
+/// Thirty percent of what is free, as omdrop caps it. Enough for a camera
+/// roll, not enough to take the machine down with it.
+fn limit_pct() -> u8 {
+    30
 }
 
 /// Receiving stays on unless someone picks a window, which is how Drop

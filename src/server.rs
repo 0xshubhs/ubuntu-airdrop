@@ -127,6 +127,31 @@ async fn guard(app: &App, headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
+/// The cap on one transfer: a share of what is free where files land.
+async fn transfer_budget(app: &App) -> Option<u64> {
+    let (dir, pct) = {
+        let cfg = app.cfg.read().await;
+        (cfg.dir.clone(), cfg.limit_pct)
+    };
+    crate::disk::budget_for(&dir, pct)
+}
+
+/// 507, with both numbers, because "too big" without them is no help.
+fn too_big(cap: u64, asked: Option<u64>) -> Response {
+    let mut say = format!(
+        "This computer will only take {} at a time",
+        human_size(cap)
+    );
+    if let Some(asked) = asked {
+        say = format!("{say}, and that is {}", human_size(asked));
+    }
+    (
+        StatusCode::INSUFFICIENT_STORAGE,
+        Json(json!({"error": format!("{say}."), "limit": cap})),
+    )
+        .into_response()
+}
+
 /// Arrivals only happen inside a window: signing in, offering, uploading and
 /// pasting all go through here.
 ///
@@ -639,6 +664,14 @@ async fn create_offer(
     if req.files.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "no files"}))).into_response();
     }
+    // The sender's own figures, so this is a courtesy: it saves uploading a
+    // video that was never going to fit. The stream is what is enforced.
+    let asked: u64 = req.files.iter().map(|f| f.size).sum();
+    if let Some(cap) = transfer_budget(&app).await {
+        if asked > cap {
+            return too_big(cap, Some(asked));
+        }
+    }
 
     let device = req
         .device
@@ -732,11 +765,14 @@ async fn upload(
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
 
-    let staged = match stream_to(multipart, &stage).await {
+    let staged = match stream_to(multipart, &stage, transfer_budget(&app).await).await {
         Ok(v) => v,
-        Err(e) => {
+        Err(spill) => {
             let _ = tokio::fs::remove_dir_all(&stage).await;
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+            return match spill {
+                Spill::TooBig(cap) => too_big(cap, None),
+                Spill::Failed(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+            };
         }
     };
     if staged.is_empty() {
@@ -765,16 +801,29 @@ async fn upload(
 }
 
 /// Write every part into `into`, returning what was written.
+/// Why a stream stopped. The two cases answer differently, so they are not
+/// one string: a transfer that outgrew the disk is not a bad request.
+enum Spill {
+    Failed(String),
+    TooBig(u64),
+}
+
+/// Stream a multipart body into `into`, stopping if it outgrows `budget`.
+///
+/// The declared sizes in an offer are checked before a byte moves, but they
+/// are the sender's word. This is the number that counts.
 async fn stream_to(
     mut multipart: Multipart,
     into: &std::path::Path,
-) -> Result<Vec<crate::offers::OfferFile>> {
-    let mut out = Vec::new();
+    budget: Option<u64>,
+) -> Result<Vec<crate::offers::OfferFile>, Spill> {
+    let mut out: Vec<crate::offers::OfferFile> = Vec::new();
+    let mut total: u64 = 0;
     loop {
         let mut field = match multipart.next_field().await {
             Ok(Some(f)) => f,
             Ok(None) => break,
-            Err(e) => anyhow::bail!(e.to_string()),
+            Err(e) => return Err(Spill::Failed(e.to_string())),
         };
         let Some(raw) = field.file_name().map(|s| s.to_string()) else {
             continue;
@@ -782,22 +831,39 @@ async fn stream_to(
 
         let path = safe_name(&raw, into);
         let mut written: u64 = 0;
-        let mut file = tokio::fs::File::create(&path).await?;
+        let mut file = tokio::fs::File::create(&path)
+            .await
+            .map_err(|e| Spill::Failed(e.to_string()))?;
         loop {
             match field.chunk().await {
                 Ok(Some(bytes)) => {
-                    file.write_all(&bytes).await?;
+                    total += bytes.len() as u64;
+                    if budget.is_some_and(|cap| total > cap) {
+                        // Stop at the cap rather than at the end of the
+                        // disk, and leave nothing behind.
+                        let _ = tokio::fs::remove_file(&path).await;
+                        for done in &out {
+                            let _ = tokio::fs::remove_file(into.join(&done.name)).await;
+                        }
+                        return Err(Spill::TooBig(budget.unwrap_or(0)));
+                    }
+                    if let Err(e) = file.write_all(&bytes).await {
+                        let _ = tokio::fs::remove_file(&path).await;
+                        return Err(Spill::Failed(e.to_string()));
+                    }
                     written += bytes.len() as u64;
                 }
                 Ok(None) => break,
                 Err(e) => {
                     // Half a file is worse than none.
                     let _ = tokio::fs::remove_file(&path).await;
-                    anyhow::bail!(e.to_string());
+                    return Err(Spill::Failed(e.to_string()));
                 }
             }
         }
-        file.flush().await?;
+        file.flush()
+            .await
+            .map_err(|e| Spill::Failed(e.to_string()))?;
         out.push(crate::offers::OfferFile {
             name: path
                 .file_name()
@@ -817,9 +883,10 @@ async fn drain(
     auto_move: bool,
     target: PathBuf,
 ) -> Response {
-    let written = match stream_to(multipart, dir).await {
+    let written = match stream_to(multipart, dir, transfer_budget(app).await).await {
         Ok(v) => v,
-        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(Spill::TooBig(cap)) => return too_big(cap, None),
+        Err(Spill::Failed(e)) => return (StatusCode::BAD_REQUEST, e).into_response(),
     };
 
     let mut saved = Vec::new();
@@ -969,6 +1036,9 @@ async fn status(
         "files_waiting": files.len(),
         "require_approval": cfg.require_approval,
         "offers": app.offers.pending().await,
+        "limit_pct": cfg.limit_pct,
+        "limit_bytes": crate::disk::budget_for(&cfg.dir, cfg.limit_pct),
+        "free_bytes": crate::disk::free_bytes(&cfg.dir),
         "receiving": receiving,
         "remaining": remaining,
         "once": once,
@@ -1169,6 +1239,42 @@ async fn set_approval(
     };
     let _ = cfg.save();
     Json(json!({"require_approval": req.enabled})).into_response()
+}
+
+#[derive(Deserialize)]
+struct LimitReq {
+    /// Percent of the free space one transfer may use. 0 lifts the cap.
+    pct: u8,
+}
+
+/// The largest transfer, as omdrop's `limit` sets it.
+async fn set_limit(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<LimitReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    if req.pct > 100 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "a percentage, so 0 to 100"})),
+        )
+            .into_response();
+    }
+    let (dir, pct) = {
+        let mut cfg = app.cfg.write().await;
+        cfg.limit_pct = req.pct;
+        let _ = cfg.save();
+        (cfg.dir.clone(), cfg.limit_pct)
+    };
+    let cap = crate::disk::budget_for(&dir, pct);
+    match cap {
+        Some(bytes) => println!("  largest transfer {pct}% of free space ({})", human_size(bytes)),
+        None => println!("  largest transfer: no cap"),
+    }
+    Json(json!({"limit_pct": pct, "limit_bytes": cap})).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1373,6 +1479,7 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/control/approval", post(set_approval))
         .route("/api/control/tunnel", post(set_tunnel))
         .route("/api/control/receiving", post(set_receiving))
+        .route("/api/control/limit", post(set_limit))
         .route("/api/control/visible-for", post(set_visible_for))
         .route("/api/control/move-all", post(move_all))
         .route("/api/control/pin", post(new_pin))

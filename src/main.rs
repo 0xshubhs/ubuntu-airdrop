@@ -3,6 +3,7 @@
 mod auth;
 mod config;
 mod discovery;
+mod disk;
 mod net;
 mod offers;
 mod page;
@@ -50,6 +51,10 @@ enum Cmd {
     },
     /// Stop receiving now
     Off,
+    /// Largest transfer, as a percentage of the free space (0 lifts it)
+    Limit {
+        pct: u8,
+    },
     /// Set how long receiving stays on from now on
     Visible {
         /// "15m", "once", "always", or a bare number of minutes
@@ -142,6 +147,20 @@ async fn main() -> Result<()> {
             )
             .await?;
             report(cfg.port).await
+        }
+
+        Cmd::Limit { pct } => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            let out = control(cfg.port, "/api/control/limit", serde_json::json!({"pct": pct})).await?;
+            match out.get("limit_bytes").and_then(|b| b.as_u64()) {
+                Some(bytes) => println!(
+                    "  largest transfer {pct}% of what is free ({})",
+                    net::human_size(bytes)
+                ),
+                None => println!("  largest transfer: no cap"),
+            }
+            Ok(())
         }
 
         Cmd::Visible { span } => {
@@ -251,6 +270,14 @@ async fn main() -> Result<()> {
                 None => println!("daemon not running"),
             }
             println!("  visible for: {}", cfg.span());
+            match disk::budget_for(&cfg.dir, cfg.limit_pct) {
+                Some(bytes) => println!(
+                    "  largest transfer  {}% of what is free ({})",
+                    cfg.limit_pct,
+                    net::human_size(bytes)
+                ),
+                None => println!("  largest transfer  no cap"),
+            }
             println!(
                 "  auto-move  {}",
                 if cfg.auto_move {

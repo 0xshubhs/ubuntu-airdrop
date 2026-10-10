@@ -116,6 +116,25 @@ to reach us to collect it. omdrop behaves the same way when you send with receiv
 `visible_for` in `~/.config/drop/config.json` remembers the choice. It defaults to
 `always`, so an upgrade does not quietly stop a phone that has worked for months.
 
+## Largest transfer
+
+A phone with a full camera roll can fill a disk in one go, and the first sign of it is
+everything else on the machine starting to fail. One transfer is capped at a share of
+the free space where files land, which is how omdrop puts it: a percentage stays
+sensible when the disk changes, and a fixed number of gigabytes does not.
+
+```bash
+drop limit 30      # the default: 30% of whatever is free
+drop limit 0       # no cap
+```
+
+The cap is checked twice. An offer carrying declared sizes is refused before a byte
+moves, which saves uploading a video that was never going to fit, and the stream itself
+is counted as it arrives, because the declared sizes are the sender's word. Going over
+stops the transfer, deletes what had landed so far and answers `507` naming both
+figures: *This computer will only take 31.3 MB at a time.* The Drop window has the same
+setting, with what the cap works out to right now.
+
 ## The window
 
 Press **Super**, type `drop`. You get everything the tray menu has, in a real window:
@@ -234,6 +253,7 @@ drop status                     # PIN, address, current settings
 drop on 15m                     # take arrivals for fifteen minutes
 drop off                        # stop taking them now
 drop visible once               # what "on" means from now on
+drop limit 30                   # largest transfer, as % of the free space
 drop panel                      # open the Drop window
 drop qr                         # QR + PIN for pairing a phone
 drop open                       # open the Drop folder
