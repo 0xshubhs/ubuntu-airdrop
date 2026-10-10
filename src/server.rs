@@ -5,6 +5,7 @@ use crate::config::{Config, COOKIE, SESSION_SECS};
 use crate::discovery::{self, Peers};
 use crate::net::{human_size, is_loopback, safe_name};
 use crate::page;
+use crate::window::{Shut, Span, Window};
 use anyhow::Result;
 use axum::body::Body;
 use axum::extract::{
@@ -21,6 +22,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio_util::io::ReaderStream;
@@ -48,6 +50,12 @@ pub struct App {
     pub shared_text: RwLock<String>,
     /// Browsers currently past the PIN.
     pub sessions: crate::sessions::Registry,
+    /// Whether this machine is taking arrivals, and for how much longer.
+    pub window: RwLock<Window>,
+    /// The mDNS handle, kept so the advertisement can be withdrawn as well as
+    /// published, and the advertisement itself while one is up.
+    pub mdns: Option<mdns_sd::ServiceDaemon>,
+    pub advert: RwLock<Option<mdns_sd::ServiceInfo>>,
 }
 
 impl App {
@@ -66,6 +74,22 @@ impl App {
     /// enough to put it on the phone.
     async fn outbox(&self) -> PathBuf {
         self.dir().await.join("Shared")
+    }
+
+    async fn receiving(&self) -> bool {
+        self.window.read().await.receiving(auth::now())
+    }
+
+    /// Opening a window because this machine is putting something up for the
+    /// other device to collect: it has to be able to reach us to take it.
+    /// omdrop does the same when you send with receiving off.
+    async fn open_for_sharing(&self) {
+        let now = auth::now();
+        let mut window = self.window.write().await;
+        if !window.receiving(now) {
+            window.open(None, now);
+            println!("  receiving on, to hand something over");
+        }
     }
 }
 
@@ -103,6 +127,24 @@ async fn guard(app: &App, headers: &HeaderMap) -> Result<(), Response> {
     }
 }
 
+/// Arrivals only happen inside a window: signing in, offering, uploading and
+/// pasting all go through here.
+///
+/// 503 rather than 403, because nothing is wrong with the request. This
+/// machine is not listening at the moment, and will be again when someone
+/// says so. A device already past the PIN can still collect what this side
+/// put up for it: that is this machine's own doing, not an arrival.
+async fn window_open(app: &App) -> Result<(), Response> {
+    if app.receiving().await {
+        return Ok(());
+    }
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "not accepting files right now", "receiving": false})),
+    )
+        .into_response())
+}
+
 /// Control endpoints are for the tray, which always runs on this machine.
 fn local_only(addr: &SocketAddr) -> Result<(), Response> {
     if is_loopback(&addr.ip()) {
@@ -127,6 +169,12 @@ async fn do_auth(
     Json(req): Json<AuthReq>,
 ) -> Response {
     let ip = addr.ip();
+
+    // Before the PIN: a machine that is not receiving has nothing to say
+    // about whether the PIN was right.
+    if let Err(r) = window_open(&app).await {
+        return r;
+    }
 
     if let Some(wait) = app.throttle.lock().await.locked_for(&ip) {
         return (
@@ -305,6 +353,9 @@ async fn receive_text(
     if let Err(r) = guard(&app, &headers).await {
         return r;
     }
+    if let Err(r) = window_open(&app).await {
+        return r;
+    }
 
     let body = req.text.trim_end_matches('\n').to_string();
     if body.is_empty() {
@@ -384,6 +435,7 @@ async fn share_text(
         req.text
     };
     *app.shared_text.write().await = body.clone();
+    app.open_for_sharing().await;
     Json(json!({"ok": true, "len": body.len()})).into_response()
 }
 
@@ -400,6 +452,7 @@ async fn share_files(
 }
 
 async fn copy_into_outbox(app: &Arc<App>, paths: Vec<String>) -> Response {
+    app.open_for_sharing().await;
     let outbox = app.outbox().await;
     if tokio::fs::create_dir_all(&outbox).await.is_err() {
         return (StatusCode::INTERNAL_SERVER_ERROR, "cannot create outbox").into_response();
@@ -580,6 +633,9 @@ async fn create_offer(
     if let Err(r) = guard(&app, &headers).await {
         return r;
     }
+    if let Err(r) = window_open(&app).await {
+        return r;
+    }
     if req.files.is_empty() {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "no files"}))).into_response();
     }
@@ -628,6 +684,9 @@ async fn upload(
     multipart: Multipart,
 ) -> Response {
     if let Err(r) = guard(&app, &headers).await {
+        return r;
+    }
+    if let Err(r) = window_open(&app).await {
         return r;
     }
 
@@ -792,6 +851,10 @@ async fn note_received(app: &Arc<App>, name: &str, size: u64) {
     recent.truncate(RECENT_MAX);
     drop(recent);
     app.counter.fetch_add(1, Ordering::Relaxed);
+    // "One file" means this one: the window closes behind it.
+    if app.window.write().await.arrived() {
+        println!("  receiving off ({})", Shut::OneFile.say());
+    }
 }
 
 /// Move a finished file out of the Drop folder. `rename` fails across
@@ -871,6 +934,17 @@ async fn status(
     let peers: Vec<_> = app.peers.read().await.values().cloned().collect();
     let shared = list_files(&app.outbox().await).await;
     let shared_text = app.shared_text.read().await.clone();
+    let (receiving, remaining, once, span, shut) = {
+        let window = app.window.read().await;
+        let now = auth::now();
+        (
+            window.receiving(now),
+            window.remaining(now),
+            window.once(),
+            window.span(),
+            window.shut(),
+        )
+    };
 
     Json(json!({
         "shared": shared.len(),
@@ -895,6 +969,16 @@ async fn status(
         "files_waiting": files.len(),
         "require_approval": cfg.require_approval,
         "offers": app.offers.pending().await,
+        "receiving": receiving,
+        "remaining": remaining,
+        "once": once,
+        "visible_for": span.spec(),
+        "visible_label": span.to_string(),
+        "off_because": shut.say(),
+        "spans": crate::window::CHOICES
+            .iter()
+            .map(|s| json!({"spec": s.spec(), "label": s.to_string()}))
+            .collect::<Vec<_>>(),
     }))
     .into_response()
 }
@@ -1087,6 +1171,102 @@ async fn set_approval(
     Json(json!({"require_approval": req.enabled})).into_response()
 }
 
+#[derive(Deserialize)]
+struct ReceivingReq {
+    enabled: bool,
+    /// A span for this window alone, leaving the stored preference as it is.
+    #[serde(default)]
+    span: Option<String>,
+}
+
+/// The switch: turn receiving on, with an optional one-off span, or off.
+async fn set_receiving(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<ReceivingReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let span = match req.span.as_deref() {
+        Some(raw) => match Span::parse(raw) {
+            Some(span) => Some(span),
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!("{raw:?} is not a length of time")})),
+                )
+                    .into_response()
+            }
+        },
+        None => None,
+    };
+
+    let now = auth::now();
+    let (receiving, remaining, label) = {
+        let mut window = app.window.write().await;
+        if req.enabled {
+            window.open(span, now);
+        } else {
+            window.close(Shut::Off);
+        }
+        let shown = span.unwrap_or_else(|| window.span());
+        (
+            window.receiving(now),
+            window.remaining(now),
+            shown.to_string(),
+        )
+    };
+    println!(
+        "  receiving {}",
+        if receiving {
+            format!("on, for {label}")
+        } else {
+            "off".to_string()
+        }
+    );
+    Json(json!({"receiving": receiving, "remaining": remaining})).into_response()
+}
+
+#[derive(Deserialize)]
+struct SpanReq {
+    spec: String,
+}
+
+/// "Stay visible for": the remembered choice, which a live window adopts at
+/// once so picking a shorter one shortens the window in front of you.
+async fn set_visible_for(
+    State(app): State<Arc<App>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Json(req): Json<SpanReq>,
+) -> Response {
+    if let Err(r) = local_only(&addr) {
+        return r;
+    }
+    let Some(span) = Span::parse(&req.spec) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("{:?} is not a length of time", req.spec)})),
+        )
+            .into_response();
+    };
+
+    {
+        let mut cfg = app.cfg.write().await;
+        cfg.visible_for = span.spec();
+        let _ = cfg.save();
+    }
+    let now = auth::now();
+    let (receiving, remaining) = {
+        let mut window = app.window.write().await;
+        window.set_span(span, now);
+        (window.receiving(now), window.remaining(now))
+    };
+    println!("  stay visible for {span}");
+    Json(json!({"visible_for": span.spec(), "receiving": receiving, "remaining": remaining}))
+        .into_response()
+}
+
 async fn set_tunnel(
     State(app): State<Arc<App>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -1192,11 +1372,42 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/api/control/auto-move", post(set_auto_move))
         .route("/api/control/approval", post(set_approval))
         .route("/api/control/tunnel", post(set_tunnel))
+        .route("/api/control/receiving", post(set_receiving))
+        .route("/api/control/visible-for", post(set_visible_for))
         .route("/api/control/move-all", post(move_all))
         .route("/api/control/pin", post(new_pin))
         // Photos and video are far past axum's 2 MB default.
         .layer(DefaultBodyLimit::disable())
         .with_state(app)
+}
+
+/// Keep the mDNS advertisement in step with the window.
+///
+/// Reconciling rather than registering at each change keeps one place in
+/// charge of it, the way the tunnel supervisor owns cloudflared: whatever
+/// opened or closed the window, the advertisement follows within a second.
+async fn sync_advert(app: &Arc<App>) {
+    let Some(mdns) = app.mdns.as_ref() else {
+        return;
+    };
+    let want = app.receiving().await;
+    if want == app.advert.read().await.is_some() {
+        return;
+    }
+    if want {
+        let (name, port) = {
+            let cfg = app.cfg.read().await;
+            (cfg.name.clone(), cfg.port)
+        };
+        match discovery::advertise(mdns, &name, port) {
+            Ok(info) => *app.advert.write().await = Some(info),
+            Err(e) => eprintln!("  mdns: could not advertise ({e})"),
+        }
+    } else if let Some(info) = app.advert.write().await.take() {
+        if let Err(e) = discovery::unadvertise(mdns, &info) {
+            eprintln!("  mdns: could not withdraw the advertisement ({e})");
+        }
+    }
 }
 
 pub async fn serve(cfg: Config) -> Result<()> {
@@ -1205,6 +1416,14 @@ pub async fn serve(cfg: Config) -> Result<()> {
     let peers: Peers = Default::default();
     let tunnel_url = Arc::new(RwLock::new(None));
     let (tunnel_tx, tunnel_rx) = mpsc::channel::<bool>(4);
+
+    let mdns = match discovery::daemon() {
+        Ok(mdns) => Some(mdns),
+        Err(e) => {
+            eprintln!("  mdns: unavailable ({e})");
+            None
+        }
+    };
 
     let app = Arc::new(App {
         peers: peers.clone(),
@@ -1217,17 +1436,30 @@ pub async fn serve(cfg: Config) -> Result<()> {
         cfg: RwLock::new(cfg.clone()),
         shared_text: RwLock::new(String::new()),
         sessions: Default::default(),
+        window: RwLock::new(Window::new(cfg.span())),
+        mdns: mdns.clone(),
+        advert: RwLock::new(None),
     });
 
-    // mDNS: advertise, and keep an eye on who else is out there.
-    match discovery::daemon() {
-        Ok(mdns) => {
-            if let Err(e) = discovery::advertise(&mdns, &cfg.name, cfg.port) {
-                eprintln!("  mdns: could not advertise ({e})");
+    // mDNS: keep an eye on who else is out there. Advertising ourselves is
+    // the visibility task's job, since it only happens inside a window.
+    if let Some(mdns) = mdns {
+        tokio::spawn(discovery::browse(mdns, cfg.name.clone(), peers.clone()));
+    }
+
+    // Visibility: close a window that has run out, and keep the
+    // advertisement in step with it.
+    {
+        let app = app.clone();
+        tokio::spawn(async move {
+            loop {
+                if app.window.write().await.sweep(auth::now()) {
+                    println!("  receiving off ({})", Shut::Expired.say());
+                }
+                sync_advert(&app).await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-            tokio::spawn(discovery::browse(mdns, cfg.name.clone(), peers.clone()));
-        }
-        Err(e) => eprintln!("  mdns: unavailable ({e})"),
+        });
     }
 
     // Tunnel supervisor: owns the cloudflared child, toggled over a channel.
@@ -1258,6 +1490,10 @@ pub async fn serve(cfg: Config) -> Result<()> {
     println!("  {}", cfg.local_url());
     println!("  saving to {}", cfg.dir.display());
     println!("  PIN {}", cfg.pin);
+    match cfg.span() {
+        Span::Always => println!("  receiving on, until you turn it off"),
+        span => println!("  receiving off; turn it on for {span} with: drop on"),
+    }
     if cfg.tunnel {
         println!("  tunnel starting…");
     }

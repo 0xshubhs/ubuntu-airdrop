@@ -52,6 +52,16 @@ pub fn advertise(mdns: &ServiceDaemon, name: &str, port: u16) -> Result<ServiceI
     Ok(info)
 }
 
+/// Take the advertisement down again.
+///
+/// A machine that has stopped receiving should stop appearing in other
+/// devices' lists, or the window is only half observed: the name is still on
+/// the phone when nothing will answer it.
+pub fn unadvertise(mdns: &ServiceDaemon, info: &ServiceInfo) -> Result<()> {
+    mdns.unregister(info.get_fullname())?;
+    Ok(())
+}
+
 /// Watch for other devices, keeping `peers` current. Never returns.
 pub async fn browse(mdns: ServiceDaemon, exclude: String, peers: Peers) -> Result<()> {
     let receiver = mdns.browse(SERVICE_TYPE)?;

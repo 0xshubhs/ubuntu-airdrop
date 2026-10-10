@@ -49,10 +49,12 @@ pub const PANEL: &str = r####"<!doctype html>
           color:var(--muted); font-weight:600; margin-bottom:.15rem}
   .addr:hover b{color:inherit}
 
-  .row{display:flex; align-items:center; justify-content:space-between; gap:1rem;
+  /* .set is the same shape, used by the rows under "Send to them". It had
+     no rule of its own, which ran each label into its caption. */
+  .row, .set{display:flex; align-items:center; justify-content:space-between; gap:1rem;
        padding:.6rem 0; border-bottom:1px solid var(--rule)}
-  .row span.label{font-size:.9rem}
-  .row small{display:block; color:var(--muted); font-size:.75rem}
+  .row span.label, .set span.label{font-size:.9rem}
+  .row small, .set small{display:block; color:var(--muted); font-size:.75rem}
 
   /* Switch */
   .sw{position:relative; width:42px; height:24px; flex:none}
@@ -69,6 +71,22 @@ pub const PANEL: &str = r####"<!doctype html>
         background:var(--ink); color:var(--paper); border-radius:7px; cursor:pointer}
   button.act:hover:not(:disabled){background:var(--signal); border-color:var(--signal)}
   button.act:disabled{opacity:.35; cursor:default}
+
+  select.act{font:inherit; font-size:.82rem; padding:.4rem .5rem; border:1px solid var(--rule);
+        background:transparent; color:inherit; border-radius:7px; cursor:pointer}
+
+  /* The window, at the top, because nothing below it matters while it is shut. */
+  .gate{display:flex; align-items:center; justify-content:space-between; gap:1rem;
+        border:1px solid var(--rule); border-radius:10px; padding:.7rem .85rem;
+        margin-bottom:1rem}
+  .gate .state{font-size:.95rem; font-weight:600}
+  .gate small{display:block; color:var(--muted); font-size:.75rem; font-weight:400}
+  .gate .dot{display:inline-block; width:.5rem; height:.5rem; border-radius:999px;
+             background:var(--rule); margin-right:.45rem; vertical-align:.05rem}
+  body.open .gate{border-color:var(--live)}
+  body.open .gate .dot{background:var(--live)}
+  /* Shut: the code and the addresses are no use to anyone, so say so quietly. */
+  body:not(.open) .hero{opacity:.4}
 
   ul{list-style:none; margin:0; padding:0}
   li{display:flex; align-items:baseline; gap:.7rem; padding:.45rem 0;
@@ -121,6 +139,12 @@ pub const PANEL: &str = r####"<!doctype html>
 
 <div id="offers"></div>
 
+<div class="gate">
+  <span class="state"><span class="dot"></span><span id="recv-state">Receiving</span>
+    <small id="recv-note"></small></span>
+  <label class="sw"><input type="checkbox" id="t-recv"><i></i></label>
+</div>
+
 <div class="hero">
   <img id="qr" alt="QR code for pairing a phone">
   <div class="side">
@@ -132,6 +156,11 @@ pub const PANEL: &str = r####"<!doctype html>
 </div>
 
 <h2>Settings</h2>
+<div class="row">
+  <span class="label">Stay visible for
+    <small>How long the switch above stays on</small></span>
+  <select class="act" id="s-span"></select>
+</div>
 <div class="row">
   <span class="label">Reachable from the internet
     <small id="tunnel-note">Off — this network only</small></span>
@@ -222,9 +251,27 @@ $('#pin').onclick = () => last && copy(last.pin);
 $('#b-open').onclick = () => post('/api/control/open');
 $('#b-move').onclick = () => post('/api/control/move-all').then(() => toast('Moved'));
 $('#b-pin').onclick  = () => { if (confirm('Generate a new PIN? Every signed-in device is logged out.')) post('/api/control/pin'); };
+$('#t-recv').onchange     = e => post('/api/control/receiving', {enabled: e.target.checked});
+$('#s-span').onchange     = e => post('/api/control/visible-for', {spec: e.target.value});
 $('#t-tunnel').onchange   = e => post('/api/control/tunnel', {enabled: e.target.checked});
 $('#t-move').onchange     = e => post('/api/control/auto-move', {enabled: e.target.checked});
 $('#t-approval').onchange = e => post('/api/control/approval', {enabled: e.target.checked});
+
+// Minutes and seconds, as the tray and the CLI show it.
+function countdown(sec){
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+// What the switch is doing, in the words the tray uses.
+function windowNote(s){
+  if (s.receiving && s.remaining != null) return countdown(s.remaining) + ' left';
+  if (s.receiving) return s.once
+    ? 'Until one file arrives' : 'Until you turn it off';
+  return s.off_because && s.off_because !== 'off'
+    ? 'Off, ' + s.off_because : 'Nothing can reach this computer';
+}
 
 function bytes(n){
   if (n < 1024) return n + ' B';
@@ -282,6 +329,21 @@ async function refresh(){
   $('#foot').textContent = s.dir;
   $('#dir-note').textContent = s.files_waiting
     ? s.files_waiting + ' waiting in ' + s.dir : 'Empty';
+
+  document.body.classList.toggle('open', !!s.receiving);
+  $('#recv-state').textContent = s.receiving ? 'Receiving' : 'Not receiving';
+  $('#recv-note').textContent = windowNote(s);
+  if (document.activeElement !== $('#t-recv')) $('#t-recv').checked = !!s.receiving;
+
+  // The choices come from the daemon, so there is one list of them.
+  const sel = $('#s-span');
+  const specs = (s.spans || []).map(o => o.spec).join(',');
+  if (sel.dataset.specs !== specs){
+    sel.dataset.specs = specs;
+    sel.innerHTML = (s.spans || []).map(o =>
+      `<option value="${esc(o.spec)}">${esc(o.label)}</option>`).join('');
+  }
+  if (document.activeElement !== sel) sel.value = s.visible_for || 'always';
 
   const pub = s.tunnel_url;
   const ap = $('#a-public');

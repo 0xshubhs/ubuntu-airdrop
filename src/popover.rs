@@ -78,6 +78,18 @@ pub const POPOVER: &str = r####"<!doctype html>
                border:1px solid var(--rule); border-radius:7px; background:transparent;
                color:var(--muted)}
   .foot button:hover{color:inherit; border-color:var(--ink)}
+  /* The window. One button, because there is no room for a switch and a
+     label, and the label is the useful half. */
+  .gate{display:block; width:100%; text-align:left; margin-bottom:.6rem;
+        padding:.45rem .6rem; border:1px solid var(--rule); border-radius:8px;
+        background:transparent; color:inherit; cursor:pointer; font:inherit;
+        font-size:.78rem}
+  .gate:hover{border-color:var(--ink)}
+  .gate b{display:block; font-size:.58rem; letter-spacing:.1em; text-transform:uppercase;
+          color:var(--muted); font-weight:650}
+  .gate.on{border-color:var(--live)}
+  .gate.on b{color:var(--live)}
+  body:not(.open) .qrwrap{opacity:.4}
   .toast{position:fixed; left:50%; bottom:.7rem; transform:translateX(-50%);
     background:var(--ink); color:var(--paper); padding:.35rem .9rem; border-radius:999px;
     font-size:.75rem; opacity:0; transition:opacity .2s; pointer-events:none}
@@ -88,6 +100,8 @@ pub const POPOVER: &str = r####"<!doctype html>
 
 <h1><span>Drop</span><span class="mono" id="who"></span></h1>
 <div id="offers"></div>
+
+<button class="gate" id="b-recv"><b>Receiving</b><span id="recv-note"></span></button>
 
 <div class="qrwrap" id="pair">
   <img id="qr" alt="QR code for pairing a phone">
@@ -137,6 +151,8 @@ async function post(path, body){
 }
 
 $('#pin').onclick    = () => last && copy(last.pin);
+$('#b-recv').onclick = () => last
+  && post('/api/control/receiving', {enabled: !last.receiving});
 $('#b-close').onclick = () => window.close();
 $('#b-window').onclick = async () => { await post('/api/control/window'); window.close(); };
 
@@ -147,6 +163,20 @@ async function decide(id, accept){
   await post('/api/control/offer/' + encodeURIComponent(id), {accept});
   toast(accept ? 'Accepted' : 'Declined');
   if (forOffer) setTimeout(() => window.close(), 700);
+}
+
+function countdown(sec){
+  const h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+function windowNote(s){
+  if (s.receiving && s.remaining != null) return countdown(s.remaining) + ' left';
+  if (s.receiving) return s.once
+    ? 'Until one file arrives' : 'Until you turn it off';
+  return s.off_because && s.off_because !== 'off'
+    ? 'Off, ' + s.off_because : 'Off';
 }
 
 function renderOffers(list){
@@ -191,6 +221,11 @@ async function refresh(){
   $('#who').textContent = s.name;
   $('#pin').textContent = s.pin;
   renderOffers(s.offers);
+
+  document.body.classList.toggle('open', !!s.receiving);
+  $('#b-recv').classList.toggle('on', !!s.receiving);
+  $('#b-recv').querySelector('b').textContent = s.receiving ? 'Receiving' : 'Not receiving';
+  $('#recv-note').textContent = windowNote(s);
 
   const pub = s.tunnel_url;
   const ap = $('#a-public');

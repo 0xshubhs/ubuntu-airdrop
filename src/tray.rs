@@ -5,7 +5,7 @@
 //! at boot — long before there is a session bus for a tray to live on.
 
 use anyhow::Result;
-use ksni::menu::{CheckmarkItem, StandardItem};
+use ksni::menu::{CheckmarkItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use ksni::{MenuItem, Tray, TrayMethods};
 use serde::Deserialize;
 use std::path::PathBuf;
@@ -61,6 +61,21 @@ pub struct Status {
     pub shared_text: String,
     #[serde(default)]
     pub outbox: PathBuf,
+    /// Taking arrivals right now.
+    #[serde(default)]
+    pub receiving: bool,
+    /// Seconds left in the window, when it is on a clock.
+    #[serde(default)]
+    pub remaining: Option<u64>,
+    /// The remembered "stay visible for" choice.
+    #[serde(default)]
+    pub visible_for: String,
+    /// Why receiving is off, when it is.
+    #[serde(default)]
+    pub off_because: String,
+    /// This window closes behind the next arrival.
+    #[serde(default)]
+    pub once: bool,
 }
 
 #[derive(Debug)]
@@ -90,6 +105,7 @@ impl Tray for DropTray {
     fn icon_name(&self) -> String {
         match &self.status {
             Some(s) if s.files_waiting > 0 => "folder-download".into(),
+            Some(s) if !s.receiving => "network-idle".into(),
             Some(_) => "network-transmit-receive".into(),
             None => "network-offline".into(),
         }
@@ -97,7 +113,13 @@ impl Tray for DropTray {
 
     fn tool_tip(&self) -> ksni::ToolTip {
         let description = match &self.status {
-            Some(s) => format!("{}\nPIN {}\n{} waiting", s.local_url, s.pin, s.files_waiting),
+            Some(s) => format!(
+                "{}\nPIN {}\nReceiving {}\n{} waiting",
+                s.local_url,
+                s.pin,
+                receiving_words(s),
+                s.files_waiting
+            ),
             None => "Daemon not reachable".into(),
         };
         ksni::ToolTip {
@@ -191,9 +213,74 @@ impl Tray for DropTray {
             items.push(MenuItem::Separator);
         }
 
+        // The switch, and how long it stays on. Everything below it only
+        // means anything while this is on.
+        let on_now = s.receiving;
+        items.push(
+            CheckmarkItem {
+                label: format!("Receiving  {}", receiving_words(&s)),
+                checked: on_now,
+                activate: Box::new(move |this: &mut Self| {
+                    if let Some(st) = this.status.as_mut() {
+                        st.receiving = !on_now;
+                    }
+                    let url = this.url("/api/control/receiving");
+                    tokio::spawn(async move {
+                        let _ = reqwest::Client::new()
+                            .post(url)
+                            .json(&serde_json::json!({"enabled": !on_now}))
+                            .send()
+                            .await;
+                    });
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
+        let chosen = crate::window::CHOICES
+            .iter()
+            .position(|span| span.spec() == s.visible_for)
+            .unwrap_or(crate::window::CHOICES.len() - 1);
+        items.push(
+            SubMenu {
+                label: "Stay visible for".into(),
+                submenu: vec![RadioGroup {
+                    selected: chosen,
+                    select: Box::new(|this: &mut Self, picked: usize| {
+                        let Some(span) = crate::window::CHOICES.get(picked) else {
+                            return;
+                        };
+                        let spec = span.spec();
+                        if let Some(st) = this.status.as_mut() {
+                            st.visible_for = spec.clone();
+                        }
+                        let url = this.url("/api/control/visible-for");
+                        tokio::spawn(async move {
+                            let _ = reqwest::Client::new()
+                                .post(url)
+                                .json(&serde_json::json!({"spec": spec}))
+                                .send()
+                                .await;
+                        });
+                    }),
+                    options: crate::window::CHOICES
+                        .iter()
+                        .map(|span| RadioItem {
+                            label: span.to_string(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                }
+                .into()],
+                ..Default::default()
+            }
+            .into(),
+        );
+
         items.push(
             StandardItem {
-                label: format!("Receiving as “{}”", s.name),
+                label: format!("Known as “{}”", s.name),
                 enabled: false,
                 ..Default::default()
             }
@@ -534,6 +621,19 @@ impl Tray for DropTray {
     }
 }
 
+/// The state of the window in a few words, for a menu label or a tooltip.
+fn receiving_words(s: &Status) -> String {
+    match (s.receiving, s.remaining) {
+        (true, Some(left)) => format!("· {} left", crate::window::countdown(left)),
+        (true, None) if s.once => "· until one file arrives".into(),
+        (true, None) => "· on".into(),
+        (false, _) if !s.off_because.is_empty() && s.off_because != "off" => {
+            format!("· off, {}", s.off_because)
+        }
+        (false, _) => "· off".into(),
+    }
+}
+
 fn short(url: &str) -> String {
     url.trim_start_matches("https://").to_string()
 }
@@ -579,9 +679,9 @@ pub fn show_qr(url: &str, pin: &str) -> Result<()> {
     Ok(())
 }
 
-/// The tunnel URL, if the daemon is up and the tunnel is running.
-pub async fn public_url(port: u16) -> Option<String> {
-    let status: Status = reqwest::Client::new()
+/// Everything the daemon knows, for the tray and the CLI.
+pub async fn status(port: u16) -> Option<Status> {
+    reqwest::Client::new()
         .get(format!("http://127.0.0.1:{port}/api/status"))
         .timeout(Duration::from_secs(3))
         .send()
@@ -589,8 +689,12 @@ pub async fn public_url(port: u16) -> Option<String> {
         .ok()?
         .json()
         .await
-        .ok()?;
-    status.tunnel_url
+        .ok()
+}
+
+/// The tunnel URL, if the daemon is up and the tunnel is running.
+pub async fn public_url(port: u16) -> Option<String> {
+    status(port).await?.tunnel_url
 }
 
 /// Only one tray may run, or the panel shows two icons.

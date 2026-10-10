@@ -14,8 +14,9 @@ mod server;
 mod sessions;
 mod tray;
 mod tunnel;
+mod window;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use std::time::Duration;
@@ -40,6 +41,19 @@ enum Cmd {
         /// Fixed PIN instead of the stored one
         #[arg(long)]
         pin: Option<String>,
+    },
+    /// Start receiving: for a while ("15m"), for one file ("once"), or
+    /// until you say otherwise ("always"). Bare numbers are minutes.
+    On {
+        /// How long, just this once. Without it, the stored choice is used.
+        span: Option<String>,
+    },
+    /// Stop receiving now
+    Off,
+    /// Set how long receiving stays on from now on
+    Visible {
+        /// "15m", "once", "always", or a bare number of minutes
+        span: String,
     },
     /// Show the indicator in the top-right of the desktop
     Tray,
@@ -101,6 +115,49 @@ async fn main() -> Result<()> {
             }
             cfg.save()?;
             server::serve(cfg).await
+        }
+
+        Cmd::On { span } => {
+            let cfg = Config::load()?;
+            tray::ensure_daemon();
+            let body = match span.as_deref() {
+                Some(raw) => {
+                    let span = window::Span::parse(raw).with_context(|| {
+                        format!("{raw:?} is not a length of time. Try 15m, 90s, 2h, once or always.")
+                    })?;
+                    serde_json::json!({"enabled": true, "span": span.spec()})
+                }
+                None => serde_json::json!({"enabled": true}),
+            };
+            control(cfg.port, "/api/control/receiving", body).await?;
+            report(cfg.port).await
+        }
+
+        Cmd::Off => {
+            let cfg = Config::load()?;
+            control(
+                cfg.port,
+                "/api/control/receiving",
+                serde_json::json!({"enabled": false}),
+            )
+            .await?;
+            report(cfg.port).await
+        }
+
+        Cmd::Visible { span } => {
+            let cfg = Config::load()?;
+            let span = window::Span::parse(&span).with_context(|| {
+                format!("{span:?} is not a length of time. Try 15m, 90s, 2h, once or always.")
+            })?;
+            tray::ensure_daemon();
+            control(
+                cfg.port,
+                "/api/control/visible-for",
+                serde_json::json!({"spec": span.spec()}),
+            )
+            .await?;
+            println!("  stay visible for: {span}");
+            report(cfg.port).await
         }
 
         Cmd::Tray => {
@@ -188,6 +245,12 @@ async fn main() -> Result<()> {
             println!("  {}", cfg.local_url());
             println!("  saving to {}", cfg.dir.display());
             println!("  PIN {}", cfg.pin);
+            print!("  receiving  ");
+            match tray::status(cfg.port).await {
+                Some(s) => println!("{}", receiving_line(&s)),
+                None => println!("daemon not running"),
+            }
+            println!("  visible for: {}", cfg.span());
             println!(
                 "  auto-move  {}",
                 if cfg.auto_move {
@@ -213,6 +276,52 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Post to the daemon's own control API, which is where the window lives:
+/// the tray and the panel go through the same routes.
+async fn control(port: u16, path: &str, body: serde_json::Value) -> Result<serde_json::Value> {
+    let reply = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}{path}"))
+        .json(&body)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .with_context(|| "the Drop daemon is not answering (systemctl --user start drop)")?;
+    let ok = reply.status().is_success();
+    let value: serde_json::Value = reply.json().await.unwrap_or_default();
+    if !ok {
+        let say = value
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("the daemon refused that");
+        anyhow::bail!("{say}");
+    }
+    Ok(value)
+}
+
+/// "on, 14:32 left" and the like, for the CLI.
+fn receiving_line(s: &tray::Status) -> String {
+    match (s.receiving, s.remaining) {
+        (true, Some(left)) => format!("on, {} left", window::countdown(left)),
+        (true, None) if s.once => "on, until one file arrives".into(),
+        (true, None) => "on".into(),
+        // "off (off)" says nothing twice; a window that ran out does.
+        (false, _) if !s.off_because.is_empty() && s.off_because != "off" => {
+            format!("off, {}", s.off_because)
+        }
+        (false, _) => "off".into(),
+    }
+}
+
+/// What the window looks like after a change, read back from the daemon so
+/// the CLI reports what is true rather than what it asked for.
+async fn report(port: u16) -> Result<()> {
+    match tray::status(port).await {
+        Some(s) => println!("  receiving {}", receiving_line(&s)),
+        None => println!("  the daemon is not answering"),
+    }
+    Ok(())
 }
 
 fn secs(v: f32) -> Duration {

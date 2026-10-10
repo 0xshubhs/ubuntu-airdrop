@@ -79,6 +79,43 @@ decline are loopback-only — nothing on the network can answer on your behalf.
 Turn it off with **Ask before receiving** in the window if you would rather transfers
 just land.
 
+## Stay visible for
+
+Drop can be open to the network for as long as the daemon runs, which is how it started
+out, or it can work the way AirDrop does: visible for a while, then quiet again. The
+second comes from [omdrop](https://github.com/brentkearney/omdrop-plugin), which ports
+AirDrop itself to Linux.
+
+```bash
+drop on 15m        # take arrivals for fifteen minutes
+drop on once       # until one file lands, then stop
+drop on            # open a window of the remembered length
+drop off           # stop now
+drop visible 15m   # remember "15 minutes" as what "on" means
+drop visible always
+```
+
+A bare number is minutes, so `drop on 15` reads the way it sounds. The tray switch, its
+**Stay visible for** submenu, the Drop window and the popover all show the same window
+and the same countdown, and choosing a shorter length shortens the window in front of
+you rather than waiting for the next one.
+
+While the window is shut:
+
+- **The mDNS advertisement goes with it.** Other Drop machines stop listing this one. A
+  device that is not accepting anything should not be in anyone's list.
+- **Arrivals are refused with 503**: signing in, offering, uploading, pasting. The phone
+  is told that this computer has stopped accepting, rather than left to guess at a
+  timeout.
+- **Collection still works.** A phone already past the PIN can take what this machine
+  put up for it, because that is this side's doing, not an arrival.
+
+Putting something up for the other device opens a window by itself, since the phone has
+to reach us to collect it. omdrop behaves the same way when you send with receiving off.
+
+`visible_for` in `~/.config/drop/config.json` remembers the choice. It defaults to
+`always`, so an upgrade does not quietly stop a phone that has worked for months.
+
 ## The window
 
 Press **Super**, type `drop`. You get everything the tray menu has, in a real window:
@@ -194,6 +231,9 @@ wl-paste | drop send thinkpad --text -  # the clipboard
 
 ```bash
 drop status                     # PIN, address, current settings
+drop on 15m                     # take arrivals for fifteen minutes
+drop off                        # stop taking them now
+drop visible once               # what "on" means from now on
 drop panel                      # open the Drop window
 drop qr                         # QR + PIN for pairing a phone
 drop open                       # open the Drop folder

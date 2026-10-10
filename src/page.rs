@@ -251,6 +251,7 @@ async function upload(list){
       }),
     });
     if (r.status === 401) { $('#held').hidden = true; showGate('Session expired. Enter the PIN again.'); return; }
+    if (r.status === 503) { held('no', 'Not receiving', 'The other computer has stopped accepting files. Turn Drop on there and try again.'); hideHeld(7000); return; }
     if (!r.ok) { held('no', 'Could not start', 'The receiver said ' + r.status + '.'); hideHeld(6000); return; }
     offer = await r.json();
   } catch {
@@ -306,6 +307,7 @@ function sendBytes(files, id, total){
     bar.style.width = '0';
     if (xhr.status === 401) { $('#held').hidden = true; showGate('Session expired. Enter the PIN again.'); return; }
     if (xhr.status === 403) { held('no', 'Declined', 'The transfer was turned down.'); hideHeld(6000); return; }
+    if (xhr.status === 503) { held('no', 'Not receiving', 'The other computer has stopped accepting files. Turn Drop on there and try again.'); hideHeld(7000); return; }
     if (xhr.status !== 200 && xhr.status !== 202) {
       held('no', 'Transfer failed', 'The receiver said ' + xhr.status + '.');
       hideHeld(6000);
@@ -343,6 +345,7 @@ $('#textform').addEventListener('submit', async e => {
 
   if (r.status === 401) { showGate('Session expired. Enter the PIN again.'); return; }
   if (r.status === 413) { note.textContent = 'Too long — send it as a file.'; return; }
+  if (r.status === 503) { note.textContent = 'The other computer has stopped accepting.'; return; }
   if (!r.ok) { note.textContent = 'Refused (' + r.status + ').'; return; }
 
   const out = await r.json().catch(() => ({}));

@@ -32,6 +32,10 @@ pub struct Config {
     /// straight into `dir`. This is the AirDrop behaviour.
     #[serde(default = "yes")]
     pub require_approval: bool,
+    /// How long turning receiving on lasts: "always" for no window at all,
+    /// "once" for one file, or a duration like "15m". See `window::Span`.
+    #[serde(default = "always")]
+    pub visible_for: String,
     /// HMAC key for session cookies. Regenerating it logs everyone out.
     pub secret: String,
 }
@@ -48,6 +52,7 @@ impl Default for Config {
             move_target: dirs::download_dir().unwrap_or_else(|| home.join("Downloads")),
             tunnel: false,
             require_approval: true,
+            visible_for: always(),
             secret: random_hex(32),
         }
     }
@@ -55,6 +60,13 @@ impl Default for Config {
 
 fn yes() -> bool {
     true
+}
+
+/// Receiving stays on unless someone picks a window, which is how Drop
+/// behaved before there was one: an upgrade must not quietly stop a phone
+/// that has worked for months.
+fn always() -> String {
+    "always".to_string()
 }
 
 impl Config {
@@ -90,6 +102,12 @@ impl Config {
         // The PIN and the cookie key live here.
         restrict(&path);
         Ok(())
+    }
+
+    /// What "on" means here, falling back to no window at all when the
+    /// config file holds something unparseable.
+    pub fn span(&self) -> crate::window::Span {
+        crate::window::Span::parse(&self.visible_for).unwrap_or(crate::window::Span::Always)
     }
 
     pub fn local_url(&self) -> String {
